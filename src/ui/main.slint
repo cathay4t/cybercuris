@@ -18,7 +18,7 @@ export component MainWindow inherits Window {
     in property <string> hide-shortcut-key: "h";
     in property <string> settings-timeout-minutes;
 
-    callback store-password(name: string, password: string);
+    callback store-password(name: string, password: string) -> bool;
     callback edit-password(old-name: string, new-name: string, new-password: string);
     callback copy-password(name: string);
     callback remove-password(name: string);
@@ -195,11 +195,12 @@ export component MainWindow inherits Window {
                     placeholder-text: "Password";
                     input-type: password;
                     accepted => {
-                        root.store-password(name-edit.text, password-edit.text);
-                        password-edit.text = "";
-                        root.show-add-password = false;
-                        root.filter-text = "";
-                        search.focus();
+                        if root.store-password(name-edit.text, password-edit.text) {
+                            password-edit.text = "";
+                            root.show-add-password = false;
+                            root.filter-text = "";
+                            search.focus();
+                        }
                     }
                 }
 
@@ -219,11 +220,12 @@ export component MainWindow inherits Window {
                         text: "Store";
                         primary: true;
                         clicked => {
-                            root.store-password(name-edit.text, password-edit.text);
-                            password-edit.text = "";
-                            root.show-add-password = false;
-                            root.filter-text = "";
-                            search.focus();
+                            if root.store-password(name-edit.text, password-edit.text) {
+                                password-edit.text = "";
+                                root.show-add-password = false;
+                                root.filter-text = "";
+                                search.focus();
+                            }
                         }
                     }
                 }

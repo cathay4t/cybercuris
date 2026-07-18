@@ -103,6 +103,10 @@ impl Keystore {
         fs::read(self.password_path(name)).context("reading encrypted password")
     }
 
+    pub(crate) fn has_password(&self, name: &str) -> bool {
+        self.password_path(name).exists()
+    }
+
     pub(crate) fn remove_password(&self, name: &str) -> anyhow::Result<()> {
         fs::remove_file(self.password_path(name))
             .with_context(|| format!("removing password for {name}"))

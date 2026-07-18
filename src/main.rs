@@ -80,9 +80,7 @@ impl CachedKey {
     /// Returns true if a key was loaded but has now expired.
     fn is_expired(&self) -> bool {
         self.key.is_some()
-            && self
-                .loaded_at
-                .is_some_and(|t| t.elapsed() >= self.timeout)
+            && self.loaded_at.is_some_and(|t| t.elapsed() >= self.timeout)
     }
 
     fn set_timeout(&mut self, timeout: Duration) {
@@ -353,8 +351,7 @@ fn unlock_key_with_init(
 
 fn aes_password_key(cached: &Arc<Mutex<CachedKey>>) -> Option<[u8; 32]> {
     let c = cached.lock().unwrap();
-    c.as_slice()
-        .map(keystore::password_aes_key_from_main_key)
+    c.as_slice().map(keystore::password_aes_key_from_main_key)
 }
 
 fn with_main_key<F, T>(cached: &Arc<Mutex<CachedKey>>, f: F) -> Option<T>
@@ -795,11 +792,17 @@ fn run_gui() -> anyhow::Result<()> {
         let all_names = all_names.clone();
         win.on_store_password(move |name, password| {
             let Some(win) = win_weak.upgrade() else {
-                return;
+                return false;
             };
             let mut app = app.borrow_mut();
-            store_password(&mut app, &win, name.as_str(), password.as_str());
+            let stored = store_password(
+                &mut app,
+                &win,
+                name.as_str(),
+                password.as_str(),
+            );
             *all_names.borrow_mut() = app.names.clone();
+            stored
         });
     }
 
@@ -990,24 +993,37 @@ fn store_password(
     win: &ui::MainWindow,
     name: &str,
     password: &str,
-) {
+) -> bool {
+    if name.is_empty() {
+        win.set_status("Name cannot be empty.".into());
+        return false;
+    }
+
+    if app.keystore.has_password(name) {
+        win.set_status(
+            format!("{name} already exists. Use Edit to change it.").into(),
+        );
+        return false;
+    }
+
     let result = {
         let c = app.cached.lock().unwrap();
         match c.as_slice() {
             Some(mk) => {
                 app.keystore.store_password(name, password.as_bytes(), mk)
             }
-            None => return,
+            None => return false,
         }
     };
 
     if let Err(e) = result {
         win.set_status(format!("Store error: {e:#}").into());
-        return;
+        return false;
     }
 
     refresh(app, win);
     win.set_status(format!("Stored {name}.").into());
+    true
 }
 
 fn edit_password(

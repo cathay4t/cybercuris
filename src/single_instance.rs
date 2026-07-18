@@ -52,9 +52,10 @@ impl Drop for InstanceGuard {
             drop(stream);
         }
         if let Ok(mut handle) = self.thread_handle.lock()
-            && let Some(h) = handle.take() {
-                let _ = h.join();
-            }
+            && let Some(h) = handle.take()
+        {
+            let _ = h.join();
+        }
         // Try to clean up the socket file.
         let _ = std::fs::remove_file(&path);
     }
