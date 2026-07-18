@@ -21,6 +21,21 @@ use crate::{
     memory_guard::{MemoryGuard, PasswordBuf},
 };
 
+/// Zero a String's heap-allocated buffer before it is dropped, preventing
+/// plaintext secrets from lingering in freed heap memory.
+/// Uses `write_volatile` to prevent compiler dead-store elimination.
+fn zero_string(s: &mut str) {
+    // SAFETY: We write within the initialized buffer bounds. The buffer
+    // is about to be dropped, so temporary invalid UTF-8 is harmless.
+    let bytes = unsafe { s.as_bytes_mut() };
+    for i in 0..bytes.len() {
+        // SAFETY: We only write zeros within the initialized buffer.
+        // The buffer is about to be dropped, so temporary invalid UTF-8
+        // is harmless.
+        unsafe { std::ptr::write_volatile(bytes.as_mut_ptr().add(i), 0) };
+    }
+}
+
 /// Write end of the self-pipe. The SIGUSR1 handler writes a byte here.
 static mut SIGUSR1_PIPE_WRITE: RawFd = -1;
 /// Read end of the self-pipe. Used by the watcher thread.
@@ -134,8 +149,10 @@ fn read_password_tty(prompt: &str) -> anyhow::Result<PasswordBuf> {
             .read_line(&mut pass)
             .context("reading password from stdin")?;
         eprintln!();
-        let pass = pass.trim_end_matches(&['\n', '\r'][..]).to_owned();
-        Ok(PasswordBuf::new(&pass)?)
+        let mut pass = pass.trim_end_matches(&['\n', '\r'][..]).to_owned();
+        let buf = PasswordBuf::new(&pass)?;
+        zero_string(&mut pass);
+        Ok(buf)
     })();
 
     // Restore terminal settings.
@@ -206,13 +223,16 @@ fn prompt_unlock_password_gui() -> anyhow::Result<PasswordBuf> {
     dialog.show()?;
     slint::run_event_loop()?;
 
-    let password = rx
+    let mut password = rx
         .recv()
         .map_err(|_| anyhow::anyhow!("Password dialog closed"))?;
     if password.is_empty() {
+        zero_string(&mut password);
         anyhow::bail!("Password dialog dismissed");
     }
-    Ok(PasswordBuf::new(&password)?)
+    let buf = PasswordBuf::new(&password)?;
+    zero_string(&mut password);
+    Ok(buf)
 }
 
 fn prompt_set_password() -> anyhow::Result<PasswordBuf> {
@@ -226,13 +246,26 @@ fn prompt_set_password() -> anyhow::Result<PasswordBuf> {
 fn prompt_set_password_tty() -> anyhow::Result<PasswordBuf> {
     let pass = read_password_tty("Enter new main key password")?;
     let confirm = read_password_tty("Confirm new main key password")?;
-    if *pass != *confirm {
+    if !constant_time_eq(pass.as_bytes(), confirm.as_bytes()) {
         anyhow::bail!("Passwords do not match");
     }
     if pass.is_empty() {
         anyhow::bail!("Password cannot be empty");
     }
     Ok(pass)
+}
+
+/// Constant-time byte comparison to prevent timing side-channels
+/// on password verification.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn prompt_set_password_gui() -> anyhow::Result<PasswordBuf> {
@@ -290,25 +323,34 @@ fn prompt_set_password_gui() -> anyhow::Result<PasswordBuf> {
         dialog.show()?;
         slint::run_event_loop()?;
 
-        let (p1, p2) = rx
+        let (mut p1, mut p2) = rx
             .recv()
             .map_err(|_| anyhow::anyhow!("Password dialog closed"))?;
 
         if p1.is_empty() && p2.is_empty() {
+            zero_string(&mut p1);
+            zero_string(&mut p2);
             anyhow::bail!("Password setup dismissed");
         }
 
-        if p1 != p2 {
+        if !constant_time_eq(p1.as_bytes(), p2.as_bytes()) {
             eprintln!("Passwords do not match.");
+            zero_string(&mut p1);
+            zero_string(&mut p2);
             continue;
         }
 
         if p1.is_empty() {
             eprintln!("Password cannot be empty.");
+            zero_string(&mut p1);
+            zero_string(&mut p2);
             continue;
         }
 
-        return Ok(PasswordBuf::new(&p1)?);
+        let buf = PasswordBuf::new(&p1)?;
+        zero_string(&mut p2);
+        zero_string(&mut p1);
+        return Ok(buf);
     }
 }
 
@@ -466,8 +508,10 @@ fn read_password(name: &str) -> anyhow::Result<PasswordBuf> {
     io::stdin()
         .read_line(&mut pass)
         .context("reading password from stdin")?;
-    let pass = pass.trim_end_matches(&['\n', '\r'][..]).to_owned();
-    Ok(PasswordBuf::new(&pass)?)
+    let mut pass = pass.trim_end_matches(&['\n', '\r'][..]).to_owned();
+    let buf = PasswordBuf::new(&pass)?;
+    zero_string(&mut pass);
+    Ok(buf)
 }
 
 fn cli_init(matches: &clap::ArgMatches) -> anyhow::Result<()> {

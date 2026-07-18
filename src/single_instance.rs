@@ -134,7 +134,11 @@ fn socket_path() -> PathBuf {
     } else if let Some(data_dir) = dirs::data_local_dir() {
         data_dir.join("cybercuris").join("socket")
     } else {
-        PathBuf::from("/tmp/cybercuris.sock")
+        // Fall back to home directory to avoid world-writable /tmp.
+        let mut home =
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.push(".cybercuris.sock");
+        home
     }
 }
 

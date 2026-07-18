@@ -67,12 +67,16 @@ impl Keystore {
             .context("reading encrypted main key")?;
 
         let aes_key = derive_key_from_password(password);
-        let plain = decrypt_data(&aes_key, &data)
+        let mut plain = decrypt_data(&aes_key, &data)
             .context("decrypting main key (wrong password?)")?;
 
         let mut guard = MemoryGuard::new(plain.len())
             .context("allocating MemoryGuard for main key")?;
         guard.as_mut_slice().copy_from_slice(&plain);
+        // Use write_volatile to prevent compiler dead-store elimination.
+        for i in 0..plain.len() {
+            unsafe { std::ptr::write_volatile(plain.as_mut_ptr().add(i), 0) };
+        }
 
         Ok(guard)
     }
@@ -176,8 +180,12 @@ pub(crate) fn decrypt_with_aes_key_into_writer(
     writer: &mut (impl io::Write + ?Sized),
 ) -> anyhow::Result<()> {
     let aes_key: Key<Aes256Gcm> = (*raw_key).into();
-    let plain = decrypt_data(&aes_key, ciphertext)?;
+    let mut plain = decrypt_data(&aes_key, ciphertext)?;
     writer.write_all(&plain)?;
+    // Use write_volatile to prevent compiler dead-store elimination.
+    for i in 0..plain.len() {
+        unsafe { std::ptr::write_volatile(plain.as_mut_ptr().add(i), 0) };
+    }
     Ok(())
 }
 
