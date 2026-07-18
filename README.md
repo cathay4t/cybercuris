@@ -8,6 +8,15 @@
  * Use AES-GCM encryption.
  * TODO: Support TOTP
 
+## GUI Usage
+ * You need to chose a main password to protect all your passwords.
+ * The encrypted keys is stored in `~/.local/share/cybercuris/`. No plain.
+ * Type to search, `Esc` to clear search bar. `Esc` again to hide main window.
+ * `Enter` to copy password. The password will drop after first paste (e.g.
+   Control+V) requested.
+ * `killall -s USR1 cybercuris` will lock the password again.
+ * Unlocked state only last 4 hours, then enter locked state.
+
 ## Workflow
  * Initialization main key if not found
    Generate random 4096 length random key, ask user to input main password

@@ -67,7 +67,15 @@ impl CachedKey {
         self.key.is_some()
             && self
                 .loaded_at
-                .map_or(false, |t| t.elapsed() < Duration::from_secs(1800))
+                .map_or(false, |t| t.elapsed() < Duration::from_secs(14400))
+    }
+
+    /// Returns true if a key was loaded but has now expired.
+    fn is_expired(&self) -> bool {
+        self.key.is_some()
+            && self
+                .loaded_at
+                .map_or(false, |t| t.elapsed() >= Duration::from_secs(14400))
     }
 
     fn drop_key(&mut self) {
@@ -828,6 +836,31 @@ fn run_gui() -> anyhow::Result<()> {
                 });
             }
         });
+    }
+
+    // Auto-lock after 30 minutes of inactivity: periodically check
+    // whether the cached key has expired and trigger a lock if so.
+    {
+        let cached = cached.clone();
+        let clipboard = clipboard.clone();
+        let win_weak = win.as_weak();
+        let timer = Box::new(slint::Timer::default());
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_secs(30),
+            move || {
+                if cached.lock().unwrap().is_expired() {
+                    cached.lock().unwrap().drop_key();
+                    *clipboard.lock().unwrap() = None;
+                    if let Some(win) = win_weak.upgrade() {
+                        win.set_locked(true);
+                        win.set_status("Session expired — please unlock.".into());
+                        win.window().hide().ok();
+                    }
+                }
+            },
+        );
+        Box::leak(timer);
     }
 
     // Start single-instance socket listener. When a second instance
