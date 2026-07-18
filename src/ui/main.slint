@@ -1,0 +1,262 @@
+import { Button, LineEdit, ListView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "cybercuris";
+    min-width: 420px;
+    min-height: 480px;
+
+    in property <[string]> password-names;
+    in property <string> status;
+
+    callback store-password(name: string, password: string);
+    callback copy-password(name: string);
+    callback remove-password(name: string);
+    callback refresh();
+    callback hide-window();
+
+    FocusScope {
+        key-pressed(event) => {
+            if event.text == "\u{001b}" {
+                root.hide-window();
+                return accept;
+            }
+            reject
+        }
+
+        VerticalBox {
+        Text {
+            text: "Stored Passwords";
+            font-size: 16px;
+            font-weight: 700;
+        }
+
+        ListView {
+            vertical-stretch: 1;
+            for name in root.password-names: HorizontalBox {
+                padding: 2px;
+                Text {
+                    text: name;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Button {
+                    text: "Copy";
+                    clicked => {
+                        root.copy-password(name);
+                    }
+                }
+                Button {
+                    text: "Remove";
+                    clicked => {
+                        root.remove-password(name);
+                    }
+                }
+            }
+        }
+
+        Text {
+            text: "Add Password";
+            font-size: 16px;
+            font-weight: 700;
+        }
+
+        name-edit := LineEdit {
+            placeholder-text: "Name";
+        }
+
+        password-edit := LineEdit {
+            placeholder-text: "Password";
+            input-type: password;
+        }
+
+        Button {
+            text: "Store";
+            primary: true;
+            clicked => {
+                root.store-password(name-edit.text, password-edit.text);
+                password-edit.text = "";
+            }
+        }
+
+        Text {
+            text: root.status;
+            wrap: word-wrap;
+            color: root.status == "" ? transparent : #a0a0a0;
+        }
+    }
+    }
+}
+
+export component ClipSelector inherits Window {
+    title: "Cybercuris - Select password to copy";
+    preferred-width: 320px;
+    preferred-height: 480px;
+
+    in-out property <string> filter-text;
+    in property <[string]> password-names;
+
+    callback copy-password(name: string);
+    callback filter-changed(string);
+    callback quit();
+
+    VerticalBox {
+        padding: 8px;
+
+        search := LineEdit {
+            placeholder-text: "Type to filter...";
+            text <=> root.filter-text;
+            init => { search.focus(); }
+            edited => {
+                root.filter-changed(root.filter-text);
+            }
+            accepted => {
+                if root.password-names.length > 0 {
+                    root.copy-password(root.password-names[0]);
+                }
+            }
+            key-pressed(event) => {
+                if event.text == "\u{001b}" {
+                    root.quit();
+                    return accept;
+                }
+                reject
+            }
+        }
+
+        ListView {
+            vertical-stretch: 1;
+            for name in root.password-names: Button {
+                text: name;
+                horizontal-stretch: 1;
+                clicked => {
+                    root.copy-password(name);
+                }
+            }
+        }
+    }
+}
+
+export component UnlockDialog inherits Window {
+    title: "Unlock Cybercuris";
+    preferred-width: 320px;
+    preferred-height: 160px;
+
+    in-out property <string> status-text;
+    callback confirmed(password: string);
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        Text {
+            text: "Enter main key password:";
+            font-size: 14px;
+        }
+
+        password-input := LineEdit {
+            placeholder-text: "Password";
+            input-type: password;
+            init => { password-input.focus(); }
+            accepted => {
+                root.confirmed(password-input.text);
+                password-input.text = "";
+            }
+        }
+
+        Text {
+            text: root.status-text;
+            color: #d04040;
+            wrap: word-wrap;
+            font-size: 12px;
+        }
+
+        HorizontalBox {
+            alignment: end;
+
+            Button {
+                text: "Unlock";
+                primary: true;
+                clicked => {
+                    root.confirmed(password-input.text);
+                    password-input.text = "";
+                }
+            }
+        }
+    }
+}
+
+export component SetPasswordDialog inherits Window {
+    title: "Initialize Cybercuris";
+    preferred-width: 360px;
+    preferred-height: 220px;
+
+    in-out property <string> status-text;
+    callback confirmed(password: string);
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        Text {
+            text: "Set a password to protect your main key.\nThis password will be required each time\nyou unlock your password store.";
+            font-size: 14px;
+        }
+
+        password1 := LineEdit {
+            placeholder-text: "New password";
+            input-type: password;
+            init => { password1.focus(); }
+            accepted => {
+                password2.focus();
+            }
+        }
+
+        password2 := LineEdit {
+            placeholder-text: "Confirm password";
+            input-type: password;
+            accepted => {
+                if password1.text != password2.text {
+                    root.status-text = "Passwords do not match.";
+                    return;
+                }
+                if password1.text == "" {
+                    root.status-text = "Password cannot be empty.";
+                    return;
+                }
+                root.confirmed(password1.text);
+                password1.text = "";
+                password2.text = "";
+            }
+        }
+
+        Text {
+            text: root.status-text;
+            color: #d04040;
+            wrap: word-wrap;
+            font-size: 12px;
+        }
+
+        HorizontalBox {
+            alignment: end;
+
+            Button {
+                text: "Set Password";
+                primary: true;
+                clicked => {
+                    if password1.text != password2.text {
+                        root.status-text = "Passwords do not match.";
+                        return;
+                    }
+                    if password1.text == "" {
+                        root.status-text = "Password cannot be empty.";
+                        return;
+                    }
+                    root.confirmed(password1.text);
+                    password1.text = "";
+                    password2.text = "";
+                }
+            }
+        }
+    }
+}
