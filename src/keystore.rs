@@ -14,6 +14,19 @@ type AesNonce = Nonce<<Aes256Gcm as AeadCore>::NonceSize>;
 
 use crate::memory_guard::MemoryGuard;
 
+/// Old PBKDF2 parameters (pre-migration).
+const PBKDF2_ITERATIONS_OLD: u32 = 100_000;
+/// Current PBKDF2 parameters (600k per OWASP 2023 recommendation).
+const PBKDF2_ITERATIONS: u32 = 600_000;
+/// Hardcoded domain-separation prefix — combined with the random salt below.
+const PBKDF2_SALT_PREFIX: &[u8] = b"cybercuris-main-key-v2";
+const PBKDF2_SALT_LEN: usize = 32;
+
+/// Old file format: nonce(12) + ciphertext(4096 + 16 GCM tag) = 4124 bytes.
+const OLD_FILE_SIZE: usize = 12 + 4096 + 16;
+/// New file format: nonce(12) + salt(32) + ciphertext(4096 + 16) = 4156 bytes.
+const NEW_FILE_SIZE: usize = 12 + PBKDF2_SALT_LEN + 4096 + 16;
+
 pub(crate) struct Keystore {
     data_dir: PathBuf,
 }
@@ -42,7 +55,9 @@ impl Keystore {
         let mut main_key = vec![0u8; 4096];
         rand::rng().fill_bytes(&mut main_key);
 
-        let aes_key = derive_key_from_password(password);
+        let mut salt = [0u8; PBKDF2_SALT_LEN];
+        rand::rng().fill_bytes(&mut salt);
+        let aes_key = derive_key_from_password(password, &salt, PBKDF2_ITERATIONS);
         let cipher = Aes256Gcm::new(&aes_key);
         let mut nonce_bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_bytes);
@@ -52,9 +67,12 @@ impl Keystore {
             .context("encrypting main key")?;
 
         let path = self.main_key_path();
-        write_with_nonce(&nonce, &ciphertext, &path)?;
+        write_new_format(&nonce, &salt, &ciphertext, &path)?;
 
-        main_key.fill(0);
+        // Use write_volatile to prevent compiler dead-store elimination.
+        for i in 0..main_key.len() {
+            unsafe { std::ptr::write_volatile(main_key.as_mut_ptr().add(i), 0) };
+        }
 
         Ok(())
     }
@@ -66,19 +84,60 @@ impl Keystore {
         let data = fs::read(self.main_key_path())
             .context("reading encrypted main key")?;
 
-        let aes_key = derive_key_from_password(password);
-        let mut plain = decrypt_data(&aes_key, &data)
-            .context("decrypting main key (wrong password?)")?;
+        match data.len() {
+            OLD_FILE_SIZE => {
+                // Legacy format. Decrypt with old parameters;
+                // if successful, silently re-encrypt with new ones.
+                let aes_key = derive_key_from_password(
+                    password,
+                    // Old format had no per-user salt — domain prefix
+                    // served as the entire salt.
+                    PBKDF2_SALT_PREFIX,
+                    PBKDF2_ITERATIONS_OLD,
+                );
+                let plain = decrypt_data(&aes_key, &data)
+                    .context("decrypting main key (wrong password?)")?;
 
-        let mut guard = MemoryGuard::new(plain.len())
-            .context("allocating MemoryGuard for main key")?;
-        guard.as_mut_slice().copy_from_slice(&plain);
-        // Use write_volatile to prevent compiler dead-store elimination.
-        for i in 0..plain.len() {
-            unsafe { std::ptr::write_volatile(plain.as_mut_ptr().add(i), 0) };
+                // Re-encrypt with a fresh random salt and higher iterations,
+                // writing atomically so a crash mid-write doesn't corrupt
+                // the existing file.
+                let mut salt = [0u8; PBKDF2_SALT_LEN];
+                rand::rng().fill_bytes(&mut salt);
+                let new_aes_key = derive_key_from_password(password, &salt, PBKDF2_ITERATIONS);
+                let cipher = Aes256Gcm::new(&new_aes_key);
+                let mut nonce_bytes = [0u8; 12];
+                rand::rng().fill_bytes(&mut nonce_bytes);
+                let nonce: AesNonce = Nonce::from(nonce_bytes);
+                let new_ct = cipher
+                    .encrypt(&nonce, plain.as_slice())
+                    .context("re-encrypting main key during migration")?;
+
+                let path = self.main_key_path();
+                write_new_format_atomic(&nonce, &salt, &new_ct, &path)?;
+
+                let guard = into_memory_guard(plain)?;
+                Ok(guard)
+            }
+            NEW_FILE_SIZE => {
+                // Current format: nonce(12) || salt(32) || ciphertext.
+                let nonce = &data[..12];
+                let user_salt: &[u8; PBKDF2_SALT_LEN] = data[12..12 + PBKDF2_SALT_LEN]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("corrupt salt"))?;
+                let aes_key =
+                    derive_key_from_password(password, user_salt, PBKDF2_ITERATIONS);
+
+                // Rebuild [nonce || ciphertext] for the existing decrypt helper.
+                let mut combined = Vec::with_capacity(12 + data.len() - 12 - PBKDF2_SALT_LEN);
+                combined.extend_from_slice(nonce);
+                combined.extend_from_slice(&data[12 + PBKDF2_SALT_LEN..]);
+                let plain = decrypt_data(&aes_key, &combined)
+                    .context("decrypting main key (wrong password?)")?;
+
+                into_memory_guard(plain)
+            }
+            _ => anyhow::bail!("Unrecognized main key file format"),
         }
-
-        Ok(guard)
     }
 
     pub(crate) fn store_password(
@@ -165,7 +224,10 @@ pub(crate) fn decrypt_with_main_key(
     let mut guard = MemoryGuard::new(plain.len())
         .context("allocating MemoryGuard for password")?;
     guard.as_mut_slice().copy_from_slice(&plain);
-    plain.fill(0);
+    // Use write_volatile to prevent compiler dead-store elimination.
+    for i in 0..plain.len() {
+        unsafe { std::ptr::write_volatile(plain.as_mut_ptr().add(i), 0) };
+    }
     Ok(guard)
 }
 
@@ -227,14 +289,52 @@ fn write_with_nonce(
     Ok(())
 }
 
-fn derive_key_from_password(password: &str) -> Key<Aes256Gcm> {
+/// Copy decrypted bytes into a zero-on-drop `MemoryGuard`, then zero the
+/// source `Vec` with `write_volatile` to defeat dead-store elimination.
+fn into_memory_guard(mut plain: Vec<u8>) -> anyhow::Result<MemoryGuard> {
+    let mut guard = MemoryGuard::new(plain.len())
+        .context("allocating MemoryGuard for main key")?;
+    guard.as_mut_slice().copy_from_slice(&plain);
+    for i in 0..plain.len() {
+        unsafe { std::ptr::write_volatile(plain.as_mut_ptr().add(i), 0) };
+    }
+    Ok(guard)
+}
+
+fn write_new_format(
+    nonce: &AesNonce,
+    salt: &[u8; PBKDF2_SALT_LEN],
+    ciphertext: &[u8],
+    path: &Path,
+) -> anyhow::Result<()> {
+    let mut data = Vec::with_capacity(12 + PBKDF2_SALT_LEN + ciphertext.len());
+    data.extend_from_slice(nonce.as_slice());
+    data.extend_from_slice(salt);
+    data.extend_from_slice(ciphertext);
+    fs::write(path, &data)?;
+    Ok(())
+}
+
+/// Write atomically: first to a temporary file, then rename into place.
+fn write_new_format_atomic(
+    nonce: &AesNonce,
+    salt: &[u8; PBKDF2_SALT_LEN],
+    ciphertext: &[u8],
+    path: &Path,
+) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    write_new_format(nonce, salt, ciphertext, &tmp)?;
+    fs::rename(&tmp, path).context("atomic rename during migration")?;
+    Ok(())
+}
+
+fn derive_key_from_password(
+    password: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> Key<Aes256Gcm> {
     let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(
-        password.as_bytes(),
-        b"cybercuris-main-key-v1",
-        100_000,
-        &mut key,
-    );
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations, &mut key);
     key.into()
 }
 
