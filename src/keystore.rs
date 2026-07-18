@@ -108,6 +108,17 @@ impl Keystore {
             .with_context(|| format!("removing password for {name}"))
     }
 
+    pub(crate) fn rename_password(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> anyhow::Result<()> {
+        fs::rename(self.password_path(old_name), self.password_path(new_name))
+            .with_context(|| {
+                format!("renaming password {old_name} to {new_name}")
+            })
+    }
+
     pub(crate) fn list_passwords(&self) -> anyhow::Result<Vec<String>> {
         let dir = self.data_dir.join("passwords");
         let mut names = vec![];

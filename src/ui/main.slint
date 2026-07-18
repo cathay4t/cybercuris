@@ -10,9 +10,12 @@ export component MainWindow inherits Window {
     in-out property <bool> locked: true;
     in property <bool> needs-init: false;
     in-out property <bool> show-add-password: false;
+    in-out property <bool> show-edit-password: false;
+    in-out property <string> edit-original-name;
     in-out property <string> filter-text;
 
     callback store-password(name: string, password: string);
+    callback edit-password(old-name: string, new-name: string, new-password: string);
     callback copy-password(name: string);
     callback remove-password(name: string);
     callback refresh();
@@ -143,6 +146,14 @@ export component MainWindow inherits Window {
                         }
                     }
                     Button {
+                        text: "Edit";
+                        clicked => {
+                            root.edit-original-name = name;
+                            root.show-add-password = false;
+                            root.show-edit-password = true;
+                        }
+                    }
+                    Button {
                         text: "Remove";
                         clicked => {
                             root.remove-password(name);
@@ -197,6 +208,55 @@ export component MainWindow inherits Window {
                 }
             }
 
+            if root.show-edit-password : VerticalBox {
+                spacing: 4px;
+
+                edit-name-edit := LineEdit {
+                    placeholder-text: "Name";
+                    init => {
+                        edit-name-edit.text = root.edit-original-name;
+                        edit-name-edit.focus();
+                    }
+                }
+
+                edit-password-edit := LineEdit {
+                    placeholder-text: "Password (leave empty to keep current)";
+                    input-type: password;
+                    accepted => {
+                        root.edit-password(root.edit-original-name, edit-name-edit.text, edit-password-edit.text);
+                        edit-password-edit.text = "";
+                        root.show-edit-password = false;
+                        root.filter-text = "";
+                        search.focus();
+                    }
+                }
+
+                HorizontalBox {
+                    alignment: end;
+                    spacing: 4px;
+
+                    Button {
+                        text: "Cancel";
+                        clicked => {
+                            root.show-edit-password = false;
+                            root.filter-text = "";
+                            search.focus();
+                        }
+                    }
+                    Button {
+                        text: "Save";
+                        primary: true;
+                        clicked => {
+                            root.edit-password(root.edit-original-name, edit-name-edit.text, edit-password-edit.text);
+                            edit-password-edit.text = "";
+                            root.show-edit-password = false;
+                            root.filter-text = "";
+                            search.focus();
+                        }
+                    }
+                }
+            }
+
             Text {
                 text: root.status;
                 wrap: word-wrap;
@@ -209,7 +269,10 @@ export component MainWindow inherits Window {
 
                 Button {
                     text: "Add";
-                    clicked => { root.show-add-password = true; }
+                    clicked => {
+                        root.show-edit-password = false;
+                        root.show-add-password = true;
+                    }
                 }
                 Button {
                     text: "Lock";

@@ -740,6 +740,26 @@ fn run_gui() -> anyhow::Result<()> {
     {
         let app = app.clone();
         let win_weak = win.as_weak();
+        let all_names = all_names.clone();
+        win.on_edit_password(move |old_name, new_name, password| {
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
+            let mut app = app.borrow_mut();
+            edit_password(
+                &mut app,
+                &win,
+                old_name.as_str(),
+                new_name.as_str(),
+                password.as_str(),
+            );
+            *all_names.borrow_mut() = app.names.clone();
+        });
+    }
+
+    {
+        let app = app.clone();
+        let win_weak = win.as_weak();
         win.on_copy_password(move |name| {
             let Some(win) = win_weak.upgrade() else {
                 return;
@@ -920,6 +940,53 @@ fn store_password(
 
     refresh(app, win);
     win.set_status(format!("Stored {name}.").into());
+}
+
+fn edit_password(
+    app: &mut App,
+    win: &ui::MainWindow,
+    old_name: &str,
+    new_name: &str,
+    password: &str,
+) {
+    if new_name.is_empty() {
+        win.set_status("Name cannot be empty.".into());
+        return;
+    }
+
+    if password.is_empty() {
+        if old_name != new_name
+            && let Err(e) = app.keystore.rename_password(old_name, new_name)
+        {
+            win.set_status(format!("Rename error: {e:#}").into());
+            return;
+        }
+    } else {
+        let result = {
+            let c = app.cached.lock().unwrap();
+            match c.as_slice() {
+                Some(mk) => app.keystore.store_password(
+                    new_name,
+                    password.as_bytes(),
+                    mk,
+                ),
+                None => return,
+            }
+        };
+        if let Err(e) = result {
+            win.set_status(format!("Store error: {e:#}").into());
+            return;
+        }
+        if old_name != new_name
+            && let Err(e) = app.keystore.remove_password(old_name)
+        {
+            win.set_status(format!("Remove error: {e:#}").into());
+            return;
+        }
+    }
+
+    refresh(app, win);
+    win.set_status(format!("Updated {new_name}.").into());
 }
 
 fn remove_password(app: &mut App, win: &ui::MainWindow, name: &str) {
