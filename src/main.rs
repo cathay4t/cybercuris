@@ -319,10 +319,6 @@ fn main() -> anyhow::Result<()> {
                 .global(true),
         )
         .subcommand(Command::new("gui").about("Launch the GUI"))
-        .subcommand(
-            Command::new("guiclip")
-                .about("Show password list, pick one to copy to clipboard"),
-        )
         .subcommand(Command::new("init").about("Initialize the main key"))
         .subcommand(
             Command::new("store").about("Store a password").arg(
@@ -365,12 +361,10 @@ fn main() -> anyhow::Result<()> {
                 run_gui()
             } else {
                 anyhow::bail!(
-                    "No WAYLAND_DISPLAY set; use CLI commands or -t for TTY \
-                     mode"
+                    "No WAYLAND_DISPLAY set; use CLI commands or -t for TTY mode"
                 );
             }
         }
-        Some(("guiclip", _)) => run_guiclip(),
         Some(("init", _)) => cli_init(),
         Some(("store", sub_m)) => cli_store(sub_m),
         Some(("get", sub_m)) => cli_get(sub_m),
@@ -464,110 +458,6 @@ fn cli_clip(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_guiclip() -> anyhow::Result<()> {
-    let keystore = Keystore::new()?;
-    let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey {
-        key: None,
-        loaded_at: None,
-    }));
-
-    unlock_key_with_init(&keystore, &cached)?;
-
-    let all_names = keystore.list_passwords()?;
-
-    if all_names.is_empty() {
-        println!("No passwords stored.");
-        return Ok(());
-    }
-
-    let aes_key = aes_password_key(&cached)
-        .ok_or_else(|| anyhow::anyhow!("Failed to get AES key"))?;
-    let clipboard = Rc::new(clipboard::spawn_clipboard_thread(aes_key)?);
-
-    let win = ui::ClipSelector::new()?;
-    slint::set_xdg_app_id(slint::SharedString::from("cybercuris_clip"))?;
-
-    let make_model = |names: &[String]| {
-        let shared: Vec<slint::SharedString> = names
-            .iter()
-            .map(|n| slint::SharedString::from(n.as_str()))
-            .collect();
-        slint::ModelRc::new(slint::VecModel::from(shared))
-    };
-    win.set_password_names(make_model(&all_names));
-
-    let tray = ui::CybercurisTray::new()?;
-
-    {
-        let win_weak = win.as_weak();
-        tray.on_show_window(move || {
-            if let Some(win) = win_weak.upgrade() {
-                let _ = win.show();
-            }
-        });
-    }
-
-    {
-        let cached_clone = cached.clone();
-        tray.on_quit(move || {
-            cached_clone.lock().unwrap().drop_key();
-            let _ = slint::quit_event_loop();
-        });
-    }
-
-    {
-        let all_names = all_names.clone();
-        let win_weak = win.as_weak();
-        win.on_filter_changed(move |text| {
-            let Some(win) = win_weak.upgrade() else {
-                return;
-            };
-            let filtered: Vec<String> = if text.is_empty() {
-                all_names.clone()
-            } else {
-                all_names
-                    .iter()
-                    .filter(|n| n.to_lowercase().contains(&text.to_lowercase()))
-                    .cloned()
-                    .collect()
-            };
-            win.set_password_names(make_model(&filtered));
-        });
-    }
-
-    {
-        let keystore = Rc::new(keystore);
-        let clipboard = clipboard.clone();
-        let win_weak = win.as_weak();
-        win.on_copy_password(move |name| {
-            let Some(win) = win_weak.upgrade() else {
-                return;
-            };
-            if let Ok(ct) = keystore.read_password_ciphertext(name.as_str()) {
-                clipboard.hold(ct);
-            }
-            win.window().hide().ok();
-        });
-    }
-
-    {
-        let win_weak = win.as_weak();
-        win.on_quit(move || {
-            if let Some(win) = win_weak.upgrade() {
-                win.window().hide().ok();
-            }
-        });
-    }
-
-    win.window()
-        .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
-
-    win.show()?;
-    slint::run_event_loop_until_quit()?;
-
-    Ok(())
-}
-
 fn cli_list() -> anyhow::Result<()> {
     let keystore = Keystore::new()?;
     let names = keystore.list_passwords()?;
@@ -588,6 +478,7 @@ fn run_gui() -> anyhow::Result<()> {
     }));
     let clipboard: Rc<RefCell<Option<clipboard::ClipboardHandle>>> =
         Rc::new(RefCell::new(None));
+    let all_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
     let win = ui::MainWindow::new()?;
     slint::set_xdg_app_id(slint::SharedString::from("cybercuris"))?;
@@ -619,6 +510,7 @@ fn run_gui() -> anyhow::Result<()> {
         let keystore = keystore.clone();
         let cached = cached.clone();
         let clipboard = clipboard.clone();
+        let all_names = all_names.clone();
         let win_weak = win.as_weak();
         win.on_unlock_password(move |password| {
             let Some(win) = win_weak.upgrade() else {
@@ -636,6 +528,7 @@ fn run_gui() -> anyhow::Result<()> {
                     win.set_locked(false);
                     win.set_status("".into());
                     let names = keystore.list_passwords().unwrap_or_default();
+                    *all_names.borrow_mut() = names.clone();
                     let shared: Vec<slint::SharedString> = names
                         .iter()
                         .map(|n| slint::SharedString::from(n.as_str()))
@@ -717,14 +610,40 @@ fn run_gui() -> anyhow::Result<()> {
     }));
 
     {
+        let all_names = all_names.clone();
+        let win_weak = win.as_weak();
+        win.on_filter_changed(move |text| {
+            let Some(win) = win_weak.upgrade() else { return };
+            let all = all_names.borrow();
+            let filtered: Vec<String> = if text.is_empty() {
+                all.clone()
+            } else {
+                all.iter()
+                    .filter(|n| n.to_lowercase().contains(&text.to_lowercase()))
+                    .cloned()
+                    .collect()
+            };
+            let shared: Vec<slint::SharedString> = filtered
+                .iter()
+                .map(|n| slint::SharedString::from(n.as_str()))
+                .collect();
+            win.set_password_names(slint::ModelRc::new(slint::VecModel::from(
+                shared,
+            )));
+        });
+    }
+
+    {
         let app = app.clone();
         let win_weak = win.as_weak();
+        let all_names = all_names.clone();
         win.on_store_password(move |name, password| {
             let Some(win) = win_weak.upgrade() else {
                 return;
             };
             let mut app = app.borrow_mut();
             store_password(&mut app, &win, name.as_str(), password.as_str());
+            *all_names.borrow_mut() = app.names.clone();
         });
     }
 
@@ -744,24 +663,28 @@ fn run_gui() -> anyhow::Result<()> {
     {
         let app = app.clone();
         let win_weak = win.as_weak();
+        let all_names = all_names.clone();
         win.on_remove_password(move |name| {
             let Some(win) = win_weak.upgrade() else {
                 return;
             };
             let mut app = app.borrow_mut();
             remove_password(&mut app, &win, name.as_str());
+            *all_names.borrow_mut() = app.names.clone();
         });
     }
 
     {
         let app = app.clone();
         let win_weak = win.as_weak();
+        let all_names = all_names.clone();
         win.on_refresh(move || {
             let Some(win) = win_weak.upgrade() else {
                 return;
             };
             let mut app = app.borrow_mut();
             refresh(&mut app, &win);
+            *all_names.borrow_mut() = app.names.clone();
         });
     }
 

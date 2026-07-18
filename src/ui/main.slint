@@ -10,6 +10,7 @@ export component MainWindow inherits Window {
     in-out property <bool> locked: true;
     in property <bool> needs-init: false;
     in-out property <bool> show-add-password: false;
+    in-out property <string> filter-text;
 
     callback store-password(name: string, password: string);
     callback copy-password(name: string);
@@ -20,6 +21,7 @@ export component MainWindow inherits Window {
     callback exit();
     callback unlock-password(password: string);
     callback set-init-password(p1: string, p2: string);
+    callback filter-changed(string);
 
     FocusScope {
         key-pressed(event) => {
@@ -100,15 +102,34 @@ export component MainWindow inherits Window {
                 font-weight: 700;
             }
 
+            search := LineEdit {
+                placeholder-text: "Search passwords...";
+                text <=> root.filter-text;
+                init => { search.focus(); }
+                edited => { root.filter-changed(root.filter-text); }
+                accepted => {
+                    if root.password-names.length > 0 {
+                        root.copy-password(root.password-names[0]);
+                    }
+                }
+            }
+
             ListView {
                 vertical-stretch: 1;
-                for name in root.password-names: HorizontalBox {
+                for name[idx] in root.password-names: HorizontalBox {
                     padding: 2px;
-                    Text {
+                    if idx == 0 : Text {
                         text: name;
-                        vertical-alignment: center;
                         horizontal-stretch: 1;
                         overflow: elide;
+                        color: #1564c0;
+                        font-size: 1.5rem;
+                    }
+                    if idx != 0 : Text {
+                        text: name;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                        font-size: 1.5rem;
                     }
                     Button {
                         text: "Copy";
@@ -130,11 +151,19 @@ export component MainWindow inherits Window {
 
                 name-edit := LineEdit {
                     placeholder-text: "Name";
+                    init => { name-edit.focus(); }
                 }
 
                 password-edit := LineEdit {
                     placeholder-text: "Password";
                     input-type: password;
+                    accepted => {
+                        root.store-password(name-edit.text, password-edit.text);
+                        password-edit.text = "";
+                        root.show-add-password = false;
+                        root.filter-text = "";
+                        search.focus();
+                    }
                 }
 
                 HorizontalBox {
@@ -143,7 +172,11 @@ export component MainWindow inherits Window {
 
                     Button {
                         text: "Cancel";
-                        clicked => { root.show-add-password = false; }
+                        clicked => {
+                            root.show-add-password = false;
+                            root.filter-text = "";
+                            search.focus();
+                        }
                     }
                     Button {
                         text: "Store";
@@ -152,6 +185,8 @@ export component MainWindow inherits Window {
                             root.store-password(name-edit.text, password-edit.text);
                             password-edit.text = "";
                             root.show-add-password = false;
+                            root.filter-text = "";
+                            search.focus();
                         }
                     }
                 }
@@ -168,7 +203,7 @@ export component MainWindow inherits Window {
                 spacing: 4px;
 
                 Button {
-                    text: "New";
+                    text: "Add";
                     clicked => { root.show-add-password = true; }
                 }
                 Button {
@@ -176,57 +211,12 @@ export component MainWindow inherits Window {
                     clicked => { root.lock(); }
                 }
                 Button {
+                    text: "Hide";
+                    clicked => { root.hide-window(); }
+                }
+                Button {
                     text: "Exit";
                     clicked => { root.exit(); }
-                }
-            }
-        }
-    }
-}
-
-export component ClipSelector inherits Window {
-    title: "Cybercuris - Select password to copy";
-    preferred-width: 320px;
-    preferred-height: 480px;
-
-    in-out property <string> filter-text;
-    in property <[string]> password-names;
-
-    callback copy-password(name: string);
-    callback filter-changed(string);
-    callback quit();
-
-    VerticalBox {
-        padding: 8px;
-
-        search := LineEdit {
-            placeholder-text: "Type to filter...";
-            text <=> root.filter-text;
-            init => { search.focus(); }
-            edited => {
-                root.filter-changed(root.filter-text);
-            }
-            accepted => {
-                if root.password-names.length > 0 {
-                    root.copy-password(root.password-names[0]);
-                }
-            }
-            key-pressed(event) => {
-                if event.text == "\u{001b}" {
-                    root.quit();
-                    return accept;
-                }
-                reject
-            }
-        }
-
-        ListView {
-            vertical-stretch: 1;
-            for name in root.password-names: Button {
-                text: name;
-                horizontal-stretch: 1;
-                clicked => {
-                    root.copy-password(name);
                 }
             }
         }
