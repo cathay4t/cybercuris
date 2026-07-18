@@ -51,11 +51,10 @@ impl Drop for InstanceGuard {
         if let Ok(stream) = UnixStream::connect(&path) {
             drop(stream);
         }
-        if let Ok(mut handle) = self.thread_handle.lock() {
-            if let Some(h) = handle.take() {
+        if let Ok(mut handle) = self.thread_handle.lock()
+            && let Some(h) = handle.take() {
                 let _ = h.join();
             }
-        }
         // Try to clean up the socket file.
         let _ = std::fs::remove_file(&path);
     }
@@ -64,7 +63,9 @@ impl Drop for InstanceGuard {
 /// Starts listening on the socket. Returns a guard that cleans up on drop.
 /// `show_window` will be called (via slint::invoke_from_event_loop) when
 /// a second instance wants to show the window.
-pub(crate) fn start_listener(show_window: Arc<dyn Fn() + Send + Sync + 'static>) -> InstanceGuard {
+pub(crate) fn start_listener(
+    show_window: Arc<dyn Fn() + Send + Sync + 'static>,
+) -> InstanceGuard {
     let show_window: ShowCallback = show_window;
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_handle = Arc::new(Mutex::new(None::<thread::JoinHandle<()>>));
@@ -108,7 +109,9 @@ pub(crate) fn start_listener(show_window: Arc<dyn Fn() + Send + Sync + 'static>)
                     thread::sleep(polling_interval);
                     continue;
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    continue;
+                }
                 Err(e) => {
                     eprintln!("Single-instance accept error: {e}");
                 }
@@ -157,10 +160,7 @@ fn bind_socket(path: &std::path::Path) -> std::io::Result<UnixListener> {
     }
 }
 
-fn handle_connection(
-    stream: UnixStream,
-    show_window: ShowCallback,
-) {
+fn handle_connection(stream: UnixStream, show_window: ShowCallback) {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     if reader.read_line(&mut line).is_ok() {

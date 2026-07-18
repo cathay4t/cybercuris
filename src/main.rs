@@ -60,14 +60,21 @@ fn check_and_reset_signal() -> bool {
 struct CachedKey {
     key: Option<MemoryGuard>,
     loaded_at: Option<Instant>,
+    timeout: Duration,
 }
 
 impl CachedKey {
+    fn new(timeout: Duration) -> Self {
+        CachedKey {
+            key: None,
+            loaded_at: None,
+            timeout,
+        }
+    }
+
     fn is_valid(&self) -> bool {
         self.key.is_some()
-            && self
-                .loaded_at
-                .map_or(false, |t| t.elapsed() < Duration::from_secs(14400))
+            && self.loaded_at.is_some_and(|t| t.elapsed() < self.timeout)
     }
 
     /// Returns true if a key was loaded but has now expired.
@@ -75,7 +82,11 @@ impl CachedKey {
         self.key.is_some()
             && self
                 .loaded_at
-                .map_or(false, |t| t.elapsed() >= Duration::from_secs(14400))
+                .is_some_and(|t| t.elapsed() >= self.timeout)
+    }
+
+    fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
     }
 
     fn drop_key(&mut self) {
@@ -343,7 +354,7 @@ fn unlock_key_with_init(
 fn aes_password_key(cached: &Arc<Mutex<CachedKey>>) -> Option<[u8; 32]> {
     let c = cached.lock().unwrap();
     c.as_slice()
-        .map(|mk| keystore::password_aes_key_from_main_key(mk))
+        .map(keystore::password_aes_key_from_main_key)
 }
 
 fn with_main_key<F, T>(cached: &Arc<Mutex<CachedKey>>, f: F) -> Option<T>
@@ -378,15 +389,13 @@ fn main() -> anyhow::Result<()> {
                 .global(true),
         )
         .subcommand(
-            Command::new("init")
-                .about("Initialize the main key")
-                .arg(
-                    Arg::new("force")
-                        .short('f')
-                        .long("force")
-                        .action(ArgAction::SetTrue)
-                        .help("Force reinitialization even if already initialized"),
-                ),
+            Command::new("init").about("Initialize the main key").arg(
+                Arg::new("force")
+                    .short('f')
+                    .long("force")
+                    .action(ArgAction::SetTrue)
+                    .help("Force reinitialization even if already initialized"),
+            ),
         )
         .subcommand(
             Command::new("store").about("Store a password").arg(
@@ -470,7 +479,9 @@ fn cli_init(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
     if keystore.is_initialized() && !matches.get_flag("force") {
         println!("Password store already initialized.");
-        println!("Use --force to reinitialize (will overwrite existing main key).");
+        println!(
+            "Use --force to reinitialize (will overwrite existing main key)."
+        );
         return Ok(());
     }
 
@@ -484,10 +495,9 @@ fn cli_store(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     FORCE_TTY.store(true, Ordering::Relaxed);
     let name = matches.get_one::<String>("NAME").unwrap();
     let keystore = Keystore::new()?;
-    let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey {
-        key: None,
-        loaded_at: None,
-    }));
+    let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey::new(
+        settings::Settings::load().timeout(),
+    )));
 
     unlock_key_with_init(&keystore, &cached)?;
 
@@ -506,10 +516,9 @@ fn cli_get(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let name = matches.get_one::<String>("NAME").unwrap();
     let keystore = Keystore::new()?;
     let ciphertext = keystore.read_password_ciphertext(name)?;
-    let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey {
-        key: None,
-        loaded_at: None,
-    }));
+    let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey::new(
+        settings::Settings::load().timeout(),
+    )));
 
     unlock_key_with_init(&keystore, &cached)?;
 
@@ -531,10 +540,9 @@ fn cli_clip(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     let name = matches.get_one::<String>("NAME").unwrap();
     let keystore = Keystore::new()?;
     let ciphertext = keystore.read_password_ciphertext(name)?;
-    let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey {
-        key: None,
-        loaded_at: None,
-    }));
+    let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey::new(
+        settings::Settings::load().timeout(),
+    )));
 
     unlock_key_with_init(&keystore, &cached)?;
 
@@ -560,10 +568,9 @@ fn cli_list() -> anyhow::Result<()> {
 
 fn run_gui() -> anyhow::Result<()> {
     let keystore = Rc::new(Keystore::new()?);
-    let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey {
-        key: None,
-        loaded_at: None,
-    }));
+    let settings = Rc::new(RefCell::new(settings::Settings::load()));
+    let cached: Arc<Mutex<CachedKey>> =
+        Arc::new(Mutex::new(CachedKey::new(settings.borrow().timeout())));
     let clipboard: Arc<Mutex<Option<clipboard::ClipboardHandle>>> =
         Arc::new(Mutex::new(None));
     let all_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -573,6 +580,63 @@ fn run_gui() -> anyhow::Result<()> {
 
     win.set_locked(true);
     win.set_needs_init(!keystore.is_initialized());
+    win.set_quit_shortcut_key(settings.borrow().quit_key.as_str().into());
+    win.set_hide_shortcut_key(settings.borrow().hide_key.as_str().into());
+    win.set_settings_timeout_minutes(
+        (settings.borrow().unlock_timeout_secs / 60)
+            .to_string()
+            .into(),
+    );
+
+    {
+        let settings = settings.clone();
+        let cached = cached.clone();
+        let win_weak = win.as_weak();
+        win.on_save_settings(move |timeout_min, quit_key, hide_key| {
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
+            let minutes: u64 = match timeout_min.trim().parse() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    win.set_status(
+                        "Invalid timeout: enter minutes > 0.".into(),
+                    );
+                    return;
+                }
+            };
+            let quit_key = quit_key.trim().to_lowercase();
+            let hide_key = hide_key.trim().to_lowercase();
+            if quit_key.chars().count() != 1 || hide_key.chars().count() != 1 {
+                win.set_status("Shortcut must be a single character.".into());
+                return;
+            }
+            if quit_key == hide_key {
+                win.set_status("Shortcuts must differ.".into());
+                return;
+            }
+            {
+                let mut s = settings.borrow_mut();
+                s.unlock_timeout_secs = minutes * 60;
+                s.quit_key = quit_key.clone();
+                s.hide_key = hide_key.clone();
+                if let Err(e) = s.save() {
+                    win.set_status(
+                        format!("Settings save error: {e:#}").into(),
+                    );
+                    return;
+                }
+            }
+            cached
+                .lock()
+                .unwrap()
+                .set_timeout(Duration::from_secs(minutes * 60));
+            win.set_quit_shortcut_key(quit_key.as_str().into());
+            win.set_hide_shortcut_key(hide_key.as_str().into());
+            win.set_settings_timeout_minutes(minutes.to_string().into());
+            win.set_status("Settings saved.".into());
+        });
+    }
 
     let tray = ui::CybercurisTray::new()?;
 
@@ -703,7 +767,9 @@ fn run_gui() -> anyhow::Result<()> {
         let all_names = all_names.clone();
         let win_weak = win.as_weak();
         win.on_filter_changed(move |text| {
-            let Some(win) = win_weak.upgrade() else { return };
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
             let all = all_names.borrow();
             let filtered: Vec<String> = if text.is_empty() {
                 all.clone()
@@ -874,7 +940,9 @@ fn run_gui() -> anyhow::Result<()> {
                     *clipboard.lock().unwrap() = None;
                     if let Some(win) = win_weak.upgrade() {
                         win.set_locked(true);
-                        win.set_status("Session expired — please unlock.".into());
+                        win.set_status(
+                            "Session expired — please unlock.".into(),
+                        );
                         win.window().hide().ok();
                     }
                 }
@@ -1029,5 +1097,6 @@ struct App {
 mod clipboard;
 mod keystore;
 mod memory_guard;
+mod settings;
 mod single_instance;
 mod ui;

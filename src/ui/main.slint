@@ -11,8 +11,12 @@ export component MainWindow inherits Window {
     in property <bool> needs-init: false;
     in-out property <bool> show-add-password: false;
     in-out property <bool> show-edit-password: false;
+    in-out property <bool> show-settings: false;
     in-out property <string> edit-original-name;
     in-out property <string> filter-text;
+    in property <string> quit-shortcut-key: "x";
+    in property <string> hide-shortcut-key: "h";
+    in property <string> settings-timeout-minutes;
 
     callback store-password(name: string, password: string);
     callback edit-password(old-name: string, new-name: string, new-password: string);
@@ -25,8 +29,21 @@ export component MainWindow inherits Window {
     callback unlock-password(password: string);
     callback set-init-password(p1: string, p2: string);
     callback filter-changed(string);
+    callback save-settings(timeout-minutes: string, quit-key: string, hide-key: string);
 
     FocusScope {
+        capture-key-pressed(event) => {
+            if event.text == root.quit-shortcut-key && event.modifiers.control {
+                root.exit();
+                return accept;
+            }
+            if event.text == root.hide-shortcut-key && event.modifiers.control {
+                root.hide-window();
+                return accept;
+            }
+            reject
+        }
+
         key-pressed(event) => {
             if event.text == "\u{001b}" {
                 if root.filter-text == "" {
@@ -153,6 +170,7 @@ export component MainWindow inherits Window {
                         clicked => {
                             root.edit-original-name = name;
                             root.show-add-password = false;
+                            root.show-settings = false;
                             root.show-edit-password = true;
                         }
                     }
@@ -260,6 +278,71 @@ export component MainWindow inherits Window {
                 }
             }
 
+            if root.show-settings : VerticalBox {
+                spacing: 4px;
+
+                HorizontalBox {
+                    spacing: 4px;
+                    Text {
+                        text: "Unlock timeout (minutes):";
+                        vertical-alignment: center;
+                    }
+                    timeout-edit := LineEdit {
+                        horizontal-stretch: 1;
+                        init => {
+                            timeout-edit.text = root.settings-timeout-minutes;
+                            timeout-edit.focus();
+                        }
+                    }
+                }
+
+                HorizontalBox {
+                    spacing: 4px;
+                    Text {
+                        text: "Quit shortcut:  Ctrl +";
+                        vertical-alignment: center;
+                    }
+                    quit-key-edit := LineEdit {
+                        horizontal-stretch: 1;
+                        init => { quit-key-edit.text = root.quit-shortcut-key; }
+                    }
+                }
+
+                HorizontalBox {
+                    spacing: 4px;
+                    Text {
+                        text: "Hide shortcut:  Ctrl +";
+                        vertical-alignment: center;
+                    }
+                    hide-key-edit := LineEdit {
+                        horizontal-stretch: 1;
+                        init => { hide-key-edit.text = root.hide-shortcut-key; }
+                    }
+                }
+
+                HorizontalBox {
+                    alignment: end;
+                    spacing: 4px;
+
+                    Button {
+                        text: "Cancel";
+                        clicked => {
+                            root.show-settings = false;
+                            search.focus();
+                        }
+                    }
+                    Button {
+                        text: "Save";
+                        primary: true;
+                        clicked => {
+                            root.save-settings(timeout-edit.text, quit-key-edit.text, hide-key-edit.text);
+                            root.show-settings = false;
+                            search.focus();
+                        }
+                    }
+                }
+            }
+
             Text {
                 text: root.status;
                 wrap: word-wrap;
@@ -274,7 +357,16 @@ export component MainWindow inherits Window {
                     text: "Add";
                     clicked => {
                         root.show-edit-password = false;
+                        root.show-settings = false;
                         root.show-add-password = true;
+                    }
+                }
+                Button {
+                    text: "Settings";
+                    clicked => {
+                        root.show-add-password = false;
+                        root.show-edit-password = false;
+                        root.show-settings = true;
                     }
                 }
                 Button {
