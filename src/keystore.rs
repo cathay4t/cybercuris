@@ -7,7 +7,7 @@ use std::{
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce, aead::Aead};
 use anyhow::Context as _;
 use pbkdf2::pbkdf2_hmac;
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 
 type AesNonce = Nonce<<Aes256Gcm as AeadCore>::NonceSize>;
