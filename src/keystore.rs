@@ -12,7 +12,7 @@ use sha2::Sha256;
 
 type AesNonce = Nonce<<Aes256Gcm as AeadCore>::NonceSize>;
 
-use crate::memory_guard::MemoryGuard;
+use crate::memory_guard::{MemoryGuard, clear_memory};
 
 /// Old PBKDF2 parameters (pre-migration).
 const PBKDF2_ITERATIONS_OLD: u32 = 100_000;
@@ -69,10 +69,7 @@ impl Keystore {
         let path = self.main_key_path();
         write_new_format(&nonce, &salt, &ciphertext, &path)?;
 
-        // Use write_volatile to prevent compiler dead-store elimination.
-        for i in 0..main_key.len() {
-            unsafe { std::ptr::write_volatile(main_key.as_mut_ptr().add(i), 0) };
-        }
+        unsafe { clear_memory(&mut main_key) };
 
         Ok(())
     }
@@ -224,10 +221,7 @@ pub(crate) fn decrypt_with_main_key(
     let mut guard = MemoryGuard::new(plain.len())
         .context("allocating MemoryGuard for password")?;
     guard.as_mut_slice().copy_from_slice(&plain);
-    // Use write_volatile to prevent compiler dead-store elimination.
-    for i in 0..plain.len() {
-        unsafe { std::ptr::write_volatile(plain.as_mut_ptr().add(i), 0) };
-    }
+    unsafe { clear_memory(&mut plain) };
     Ok(guard)
 }
 
@@ -244,10 +238,7 @@ pub(crate) fn decrypt_with_aes_key_into_writer(
     let aes_key: Key<Aes256Gcm> = (*raw_key).into();
     let mut plain = decrypt_data(&aes_key, ciphertext)?;
     writer.write_all(&plain)?;
-    // Use write_volatile to prevent compiler dead-store elimination.
-    for i in 0..plain.len() {
-        unsafe { std::ptr::write_volatile(plain.as_mut_ptr().add(i), 0) };
-    }
+    unsafe { clear_memory(&mut plain) };
     Ok(())
 }
 
@@ -295,9 +286,7 @@ fn into_memory_guard(mut plain: Vec<u8>) -> anyhow::Result<MemoryGuard> {
     let mut guard = MemoryGuard::new(plain.len())
         .context("allocating MemoryGuard for main key")?;
     guard.as_mut_slice().copy_from_slice(&plain);
-    for i in 0..plain.len() {
-        unsafe { std::ptr::write_volatile(plain.as_mut_ptr().add(i), 0) };
-    }
+    unsafe { clear_memory(&mut plain) };
     Ok(guard)
 }
 

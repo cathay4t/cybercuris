@@ -18,22 +18,13 @@ use slint::ComponentHandle;
 
 use crate::{
     keystore::Keystore,
-    memory_guard::{MemoryGuard, PasswordBuf},
+    memory_guard::{MemoryGuard, PasswordBuf, clear_memory},
 };
 
 /// Zero a String's heap-allocated buffer before it is dropped, preventing
 /// plaintext secrets from lingering in freed heap memory.
-/// Uses `write_volatile` to prevent compiler dead-store elimination.
 fn zero_string(s: &mut str) {
-    // SAFETY: We write within the initialized buffer bounds. The buffer
-    // is about to be dropped, so temporary invalid UTF-8 is harmless.
-    let bytes = unsafe { s.as_bytes_mut() };
-    for i in 0..bytes.len() {
-        // SAFETY: We only write zeros within the initialized buffer.
-        // The buffer is about to be dropped, so temporary invalid UTF-8
-        // is harmless.
-        unsafe { std::ptr::write_volatile(bytes.as_mut_ptr().add(i), 0) };
-    }
+    unsafe { clear_memory(s.as_bytes_mut()) };
 }
 
 /// Write end of the self-pipe. The SIGUSR1 handler writes a byte here.

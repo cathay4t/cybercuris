@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::{ops::Deref, ptr};
 
+/// Zero a mutable byte slice using `write_volatile` to prevent the
+/// compiler from eliminating the writes as dead stores.
+///
+/// # Safety
+/// The caller must ensure the slice points to initialized memory that
+/// is about to be deallocated or will not be read again as valid data.
+pub(crate) unsafe fn clear_memory(buf: &mut [u8]) {
+    for i in 0..buf.len() {
+        // SAFETY: The caller guarantees the slice points to initialized
+        // memory that is about to be dropped or deallocated.
+        unsafe { ptr::write_volatile(buf.as_mut_ptr().add(i), 0) };
+    }
+}
+
 pub(crate) struct MemoryGuard(Vec<u8>);
 
 pub(crate) struct PasswordBuf {
@@ -86,11 +100,7 @@ impl Drop for MemoryGuard {
         // about to be freed (see Vec docs: "Even if you zero a Vec's
         // memory first, that might not actually happen because the
         // optimizer does not consider this a side-effect").
-        for i in 0..len {
-            unsafe {
-                ptr::write_volatile(self.0.as_mut_ptr().add(i), 0);
-            }
-        }
+        unsafe { clear_memory(&mut self.0) };
         unsafe {
             libc::munlock(aligned as *const libc::c_void, aligned_len);
         }
