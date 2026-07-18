@@ -337,6 +337,8 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ClipboardState {
                     drop(file);
                     state.send_count += 1;
                     if state.send_count >= 2 {
+                        // Paste-once: drop ciphertext after full paste cycle
+                        state.held = None;
                         if let Some(tx) = state.done_tx.take() {
                             let _ = tx.send(());
                         }

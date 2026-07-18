@@ -6,7 +6,6 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -98,55 +97,63 @@ fn prompt_unlock_password() -> anyhow::Result<PasswordBuf> {
 
 fn prompt_unlock_password_gui() -> anyhow::Result<PasswordBuf> {
     let dialog = ui::UnlockDialog::new()?;
+    slint::set_xdg_app_id(slint::SharedString::from("cybercuris"))?;
     let (tx, rx) = std::sync::mpsc::channel();
 
     let dlg_weak = dialog.as_weak();
-    dialog.on_confirmed(move |password| {
-        let _ = tx.send(password.to_string());
-        // Defer hide+quit to next event-loop tick so the Wayland
-        // compositor receives the hide before we tear down the loop.
-        let timer = Box::new(slint::Timer::default());
+    let do_confirm = {
         let dlg_weak = dlg_weak.clone();
+        let tx = tx.clone();
+        move || {
+            let password = if let Some(dlg) = dlg_weak.upgrade() {
+                let p = dlg.get_password_text().to_string();
+                dlg.hide().ok();
+                p
+            } else {
+                String::new()
+            };
+            let _ = tx.send(password);
+            let timer = Box::new(slint::Timer::default());
+            timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(50),
+                move || {
+                    let _ = slint::quit_event_loop();
+                },
+            );
+            Box::leak(timer);
+        }
+    };
+
+    dialog.on_accepted(do_confirm.clone());
+    dialog.on_ok_clicked(do_confirm);
+
+    dialog.on_cancel_clicked(move || {
+        if let Some(dlg) = dlg_weak.upgrade() {
+            dlg.hide().ok();
+        }
+        let _ = tx.send(String::new());
+        let timer = Box::new(slint::Timer::default());
         timer.start(
             slint::TimerMode::SingleShot,
-            Duration::ZERO,
+            Duration::from_millis(50),
             move || {
-                if let Some(dlg) = dlg_weak.upgrade() {
-                    dlg.window().hide().ok();
-                }
                 let _ = slint::quit_event_loop();
             },
         );
         Box::leak(timer);
     });
 
-    {
-        let dlg_weak = dialog.as_weak();
-        dialog.window().on_close_requested(move || {
-            // Hide the window first, then quit on next tick
-            if let Some(dlg) = dlg_weak.upgrade() {
-                dlg.window().hide().ok();
-            }
-            let timer = Box::new(slint::Timer::default());
-            timer.start(
-                slint::TimerMode::SingleShot,
-                Duration::ZERO,
-                move || {
-                    let _ = slint::quit_event_loop();
-                },
-            );
-            Box::leak(timer);
-            slint::CloseRequestResponse::HideWindow
-        });
-    }
-
     dialog.show()?;
     slint::run_event_loop()?;
-    drop(dialog);
 
-    rx.recv()
-        .map_err(|_| anyhow::anyhow!("Password dialog closed"))
-        .and_then(|s| Ok(PasswordBuf::new(&s)?))
+    let password = rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("Password dialog closed"))?;
+    if password.is_empty() {
+        anyhow::bail!("Password dialog dismissed");
+    }
+    Ok(PasswordBuf::new(&password)?)
 }
 
 fn prompt_set_password() -> anyhow::Result<PasswordBuf> {
@@ -170,86 +177,79 @@ fn prompt_set_password_tty() -> anyhow::Result<PasswordBuf> {
 }
 
 fn prompt_set_password_gui() -> anyhow::Result<PasswordBuf> {
-    let dialog = ui::SetPasswordDialog::new()?;
-    let (tx, rx) = std::sync::mpsc::channel();
+    slint::set_xdg_app_id(slint::SharedString::from("cybercuris"))?;
 
-    let dlg_weak = dialog.as_weak();
-    dialog.on_confirmed(move |password| {
-        let _ = tx.send(password.to_string());
-        // Defer hide+quit to next event-loop tick so the Wayland
-        // compositor receives the hide before we tear down the loop.
-        let timer = Box::new(slint::Timer::default());
-        let dlg_weak = dlg_weak.clone();
-        timer.start(
-            slint::TimerMode::SingleShot,
-            Duration::ZERO,
-            move || {
-                if let Some(dlg) = dlg_weak.upgrade() {
-                    dlg.window().hide().ok();
-                }
-                let _ = slint::quit_event_loop();
-            },
-        );
-        Box::leak(timer);
-    });
+    loop {
+        let dialog = ui::SetPasswordDialog::new()?;
+        let (tx, rx) = std::sync::mpsc::channel();
 
-    {
         let dlg_weak = dialog.as_weak();
-        dialog.window().on_close_requested(move || {
-            if let Some(dlg) = dlg_weak.upgrade() {
-                dlg.window().hide().ok();
+        let do_confirm = {
+            let dlg_weak = dlg_weak.clone();
+            let tx = tx.clone();
+            move || {
+                let (p1, p2) = if let Some(dlg) = dlg_weak.upgrade() {
+                    let p1 = dlg.get_password1().to_string();
+                    let p2 = dlg.get_password2().to_string();
+                    dlg.hide().ok();
+                    (p1, p2)
+                } else {
+                    (String::new(), String::new())
+                };
+                let _ = tx.send((p1, p2));
+                let timer = Box::new(slint::Timer::default());
+                timer.start(
+                    slint::TimerMode::SingleShot,
+                    Duration::from_millis(50),
+                    move || {
+                        let _ = slint::quit_event_loop();
+                    },
+                );
+                Box::leak(timer);
             }
+        };
+
+        dialog.on_accepted(do_confirm.clone());
+        dialog.on_ok_clicked(do_confirm);
+
+        dialog.on_cancel_clicked(move || {
+            if let Some(dlg) = dlg_weak.upgrade() {
+                dlg.hide().ok();
+            }
+            let _ = tx.send((String::new(), String::new()));
             let timer = Box::new(slint::Timer::default());
             timer.start(
                 slint::TimerMode::SingleShot,
-                Duration::ZERO,
+                Duration::from_millis(50),
                 move || {
                     let _ = slint::quit_event_loop();
                 },
             );
             Box::leak(timer);
-            slint::CloseRequestResponse::HideWindow
         });
-    }
 
-    dialog.show()?;
-    slint::run_event_loop()?;
-    drop(dialog);
+        dialog.show()?;
+        slint::run_event_loop()?;
 
-    rx.recv()
-        .map_err(|_| anyhow::anyhow!("Password dialog closed"))
-        .and_then(|s| Ok(PasswordBuf::new(&s)?))
-}
+        let (p1, p2) = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Password dialog closed"))?;
 
-fn unlock_key(
-    keystore: &Keystore,
-    cached: &Arc<Mutex<CachedKey>>,
-) -> anyhow::Result<()> {
-    if check_and_reset_signal() {
-        cached.lock().unwrap().drop_key();
-    }
-
-    {
-        let c = cached.lock().unwrap();
-        if c.is_valid() {
-            return Ok(());
+        if p1.is_empty() && p2.is_empty() {
+            anyhow::bail!("Password setup dismissed");
         }
-    }
 
-    loop {
-        let password = prompt_unlock_password()?;
-        if password.is_empty() {
-            anyhow::bail!("No password provided");
+        if p1 != p2 {
+            eprintln!("Passwords do not match.");
+            continue;
         }
-        match keystore.load_main_key(&password) {
-            Ok(guard) => {
-                cached.lock().unwrap().set(guard);
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!("Wrong password: {e:#}");
-            }
+
+        if p1.is_empty() {
+            eprintln!("Password cannot be empty.");
+            continue;
         }
+
+        return Ok(PasswordBuf::new(&p1)?);
     }
 }
 
@@ -496,10 +496,23 @@ fn run_guiclip() -> anyhow::Result<()> {
     };
     win.set_password_names(make_model(&all_names));
 
-    let (tray_tx, tray_rx) = mpsc::channel::<tray::TrayAction>();
-    let cybertray = tray::CybercurisTray::new(tray_tx);
-    if let Err(e) = ksni::blocking::TrayMethods::spawn(cybertray) {
-        eprintln!("System tray not available: {e:#}");
+    let tray = ui::CybercurisTray::new()?;
+
+    {
+        let win_weak = win.as_weak();
+        tray.on_show_window(move || {
+            if let Some(win) = win_weak.upgrade() {
+                let _ = win.show();
+            }
+        });
+    }
+
+    {
+        let cached_clone = cached.clone();
+        tray.on_quit(move || {
+            cached_clone.lock().unwrap().drop_key();
+            let _ = slint::quit_event_loop();
+        });
     }
 
     {
@@ -549,32 +562,8 @@ fn run_guiclip() -> anyhow::Result<()> {
     win.window()
         .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
-    let tray_timer = slint::Timer::default();
-    {
-        let win_weak = win.as_weak();
-        let cached_clone = cached.clone();
-        tray_timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(250),
-            move || {
-                while let Ok(action) = tray_rx.try_recv() {
-                    match action {
-                        tray::TrayAction::ShowWindow => {
-                            if let Some(win) = win_weak.upgrade() {
-                                let _ = win.show();
-                            }
-                        }
-                        tray::TrayAction::Quit => {
-                            cached_clone.lock().unwrap().drop_key();
-                            let _ = slint::quit_event_loop();
-                        }
-                    }
-                }
-            },
-        );
-    }
-
-    win.run()?;
+    win.show()?;
+    slint::run_event_loop_until_quit()?;
 
     Ok(())
 }
@@ -597,25 +586,132 @@ fn run_gui() -> anyhow::Result<()> {
         key: None,
         loaded_at: None,
     }));
-
-    unlock_key_with_init(&keystore, &cached)?;
-
-    let aes_key = aes_password_key(&cached)
-        .ok_or_else(|| anyhow::anyhow!("Failed to get AES key"))?;
-    let clipboard = clipboard::spawn_clipboard_thread(aes_key)?;
+    let clipboard: Rc<RefCell<Option<clipboard::ClipboardHandle>>> =
+        Rc::new(RefCell::new(None));
 
     let win = ui::MainWindow::new()?;
     slint::set_xdg_app_id(slint::SharedString::from("cybercuris"))?;
 
-    let (tray_tx, tray_rx) = mpsc::channel::<tray::TrayAction>();
-    let cybertray = tray::CybercurisTray::new(tray_tx);
-    if let Err(e) = ksni::blocking::TrayMethods::spawn(cybertray) {
-        eprintln!("System tray not available: {e:#}");
+    win.set_locked(true);
+    win.set_needs_init(!keystore.is_initialized());
+
+    let tray = ui::CybercurisTray::new()?;
+
+    {
+        let win_weak = win.as_weak();
+        tray.on_show_window(move || {
+            if let Some(win) = win_weak.upgrade() {
+                let _ = win.show();
+            }
+        });
+    }
+
+    {
+        let cached_clone = cached.clone();
+        tray.on_quit(move || {
+            cached_clone.lock().unwrap().drop_key();
+            let _ = slint::quit_event_loop();
+        });
+    }
+
+    // Unlock callback
+    {
+        let keystore = keystore.clone();
+        let cached = cached.clone();
+        let clipboard = clipboard.clone();
+        let win_weak = win.as_weak();
+        win.on_unlock_password(move |password| {
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
+            match keystore.load_main_key(&password) {
+                Ok(guard) => {
+                    let aes_key = keystore::password_aes_key_from_main_key(
+                        guard.as_slice(),
+                    );
+                    *clipboard.borrow_mut() = Some(
+                        clipboard::spawn_clipboard_thread(aes_key).unwrap(),
+                    );
+                    cached.lock().unwrap().set(guard);
+                    win.set_locked(false);
+                    win.set_status("".into());
+                    let names = keystore.list_passwords().unwrap_or_default();
+                    let shared: Vec<slint::SharedString> = names
+                        .iter()
+                        .map(|n| slint::SharedString::from(n.as_str()))
+                        .collect();
+                    win.set_password_names(slint::ModelRc::new(
+                        slint::VecModel::from(shared),
+                    ));
+                }
+                Err(_) => {
+                    win.set_status("Wrong password.".into());
+                }
+            }
+        });
+    }
+
+    // Set init password callback
+    {
+        let keystore = keystore.clone();
+        let cached = cached.clone();
+        let clipboard = clipboard.clone();
+        let win_weak = win.as_weak();
+        win.on_set_init_password(move |p1, p2| {
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
+            if p1 != p2 {
+                win.set_status("Passwords do not match.".into());
+                return;
+            }
+            if p1.is_empty() {
+                win.set_status("Password cannot be empty.".into());
+                return;
+            }
+            if let Err(e) = keystore.init_main_key(&p1) {
+                win.set_status(format!("Init error: {e:#}").into());
+                return;
+            }
+            match keystore.load_main_key(&p1) {
+                Ok(guard) => {
+                    let aes_key = keystore::password_aes_key_from_main_key(
+                        guard.as_slice(),
+                    );
+                    *clipboard.borrow_mut() = Some(
+                        clipboard::spawn_clipboard_thread(aes_key).unwrap(),
+                    );
+                    cached.lock().unwrap().set(guard);
+                    win.set_needs_init(false);
+                    win.set_locked(false);
+                    win.set_status("".into());
+                }
+                Err(e) => {
+                    win.set_status(format!("Load error: {e:#}").into());
+                }
+            }
+        });
+    }
+
+    // Lock callback
+    {
+        let cached = cached.clone();
+        let clipboard = clipboard.clone();
+        let win_weak = win.as_weak();
+        win.on_lock(move || {
+            cached.lock().unwrap().drop_key();
+            *clipboard.borrow_mut() = None;
+            if let Some(win) = win_weak.upgrade() {
+                win.set_locked(true);
+                win.set_status("".into());
+                win.window().hide().ok();
+            }
+        });
     }
 
     let app = Rc::new(RefCell::new(App {
         keystore: keystore.clone(),
-        clipboard,
+        clipboard: clipboard.clone(),
         cached: cached.clone(),
         names: Vec::new(),
     }));
@@ -624,12 +720,10 @@ fn run_gui() -> anyhow::Result<()> {
         let app = app.clone();
         let win_weak = win.as_weak();
         win.on_store_password(move |name, password| {
-            let win = win_weak.upgrade().unwrap();
-            let mut app = app.borrow_mut();
-            if unlock_key(&app.keystore, &app.cached).is_err() {
-                win.set_status("Failed to unlock main key.".into());
+            let Some(win) = win_weak.upgrade() else {
                 return;
-            }
+            };
+            let mut app = app.borrow_mut();
             store_password(&mut app, &win, name.as_str(), password.as_str());
         });
     }
@@ -638,12 +732,10 @@ fn run_gui() -> anyhow::Result<()> {
         let app = app.clone();
         let win_weak = win.as_weak();
         win.on_copy_password(move |name| {
-            let win = win_weak.upgrade().unwrap();
-            let mut app = app.borrow_mut();
-            if unlock_key(&app.keystore, &app.cached).is_err() {
-                win.set_status("Failed to unlock main key.".into());
+            let Some(win) = win_weak.upgrade() else {
                 return;
-            }
+            };
+            let mut app = app.borrow_mut();
             copy_password(&mut app, &win, name.as_str());
             win.window().hide().ok();
         });
@@ -653,7 +745,9 @@ fn run_gui() -> anyhow::Result<()> {
         let app = app.clone();
         let win_weak = win.as_weak();
         win.on_remove_password(move |name| {
-            let win = win_weak.upgrade().unwrap();
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
             let mut app = app.borrow_mut();
             remove_password(&mut app, &win, name.as_str());
         });
@@ -663,7 +757,9 @@ fn run_gui() -> anyhow::Result<()> {
         let app = app.clone();
         let win_weak = win.as_weak();
         win.on_refresh(move || {
-            let win = win_weak.upgrade().unwrap();
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
             let mut app = app.borrow_mut();
             refresh(&mut app, &win);
         });
@@ -678,37 +774,19 @@ fn run_gui() -> anyhow::Result<()> {
         });
     }
 
-    refresh(&mut app.borrow_mut(), &win);
+    {
+        let cached_clone = cached.clone();
+        win.on_exit(move || {
+            cached_clone.lock().unwrap().drop_key();
+            let _ = slint::quit_event_loop();
+        });
+    }
 
     win.window()
         .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
-    let tray_timer = slint::Timer::default();
-    {
-        let win_weak = win.as_weak();
-        let cached_clone = cached.clone();
-        tray_timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(250),
-            move || {
-                while let Ok(action) = tray_rx.try_recv() {
-                    match action {
-                        tray::TrayAction::ShowWindow => {
-                            if let Some(win) = win_weak.upgrade() {
-                                let _ = win.show();
-                            }
-                        }
-                        tray::TrayAction::Quit => {
-                            cached_clone.lock().unwrap().drop_key();
-                            let _ = slint::quit_event_loop();
-                        }
-                    }
-                }
-            },
-        );
-    }
-
-    win.run()?;
+    win.show()?;
+    slint::run_event_loop_until_quit()?;
 
     Ok(())
 }
@@ -722,8 +800,10 @@ fn copy_password(app: &mut App, win: &ui::MainWindow, name: &str) {
         }
     };
 
-    app.clipboard.hold(ciphertext);
-    win.set_status(format!("Copied {name} to clipboard.").into());
+    if let Some(ref clip) = *app.clipboard.borrow() {
+        clip.hold(ciphertext);
+        win.set_status(format!("Copied {name} to clipboard.").into());
+    }
 }
 
 fn store_password(
@@ -783,7 +863,7 @@ fn refresh(app: &mut App, win: &ui::MainWindow) {
 
 struct App {
     keystore: Rc<Keystore>,
-    clipboard: clipboard::ClipboardHandle,
+    clipboard: Rc<RefCell<Option<clipboard::ClipboardHandle>>>,
     cached: Arc<Mutex<CachedKey>>,
     names: Vec<String>,
 }
@@ -791,5 +871,4 @@ struct App {
 mod clipboard;
 mod keystore;
 mod memory_guard;
-mod tray;
 mod ui;
