@@ -77,14 +77,38 @@ fn has_wayland() -> bool {
 }
 
 fn read_password_tty(prompt: &str) -> anyhow::Result<PasswordBuf> {
-    eprint!("{prompt}: ");
-    io::stderr().flush().ok();
-    let mut pass = String::new();
-    io::stdin()
-        .read_line(&mut pass)
-        .context("reading password from stdin")?;
-    let pass = pass.trim_end_matches(&['\n', '\r'][..]).to_owned();
-    Ok(PasswordBuf::new(&pass)?)
+    use std::os::fd::AsRawFd;
+
+    let stdin_fd = io::stdin().as_raw_fd();
+
+    // Save current terminal settings and disable echo.
+    let saved_term = unsafe {
+        let mut term: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(stdin_fd, &mut term);
+        let saved = term;
+        term.c_lflag &= !libc::ECHO;
+        libc::tcsetattr(stdin_fd, libc::TCSANOW, &term);
+        saved
+    };
+
+    let result = (|| -> anyhow::Result<PasswordBuf> {
+        eprint!("{prompt}: ");
+        io::stderr().flush().ok();
+        let mut pass = String::new();
+        io::stdin()
+            .read_line(&mut pass)
+            .context("reading password from stdin")?;
+        eprintln!();
+        let pass = pass.trim_end_matches(&['\n', '\r'][..]).to_owned();
+        Ok(PasswordBuf::new(&pass)?)
+    })();
+
+    // Restore terminal settings.
+    unsafe {
+        libc::tcsetattr(stdin_fd, libc::TCSANOW, &saved_term);
+    }
+
+    result
 }
 
 fn prompt_unlock_password() -> anyhow::Result<PasswordBuf> {
@@ -309,7 +333,6 @@ fn main() -> anyhow::Result<()> {
 
     let matches = Command::new("cybercuris")
         .about("Linux password manager")
-        .arg_required_else_help(true)
         .arg(
             Arg::new("tty")
                 .short('t')
@@ -318,8 +341,17 @@ fn main() -> anyhow::Result<()> {
                 .help("Force TTY password input mode")
                 .global(true),
         )
-        .subcommand(Command::new("gui").about("Launch the GUI"))
-        .subcommand(Command::new("init").about("Initialize the main key"))
+        .subcommand(
+            Command::new("init")
+                .about("Initialize the main key")
+                .arg(
+                    Arg::new("force")
+                        .short('f')
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help("Force reinitialization even if already initialized"),
+                ),
+        )
         .subcommand(
             Command::new("store").about("Store a password").arg(
                 Arg::new("NAME")
@@ -356,16 +388,20 @@ fn main() -> anyhow::Result<()> {
     }
 
     match matches.subcommand() {
-        Some(("gui", _)) | None => {
+        None => {
+            // No subcommand: launch GUI if WAYLAND_DISPLAY is set,
+            // otherwise print help.
             if has_wayland() {
                 run_gui()
             } else {
-                anyhow::bail!(
-                    "No WAYLAND_DISPLAY set; use CLI commands or -t for TTY mode"
-                );
+                let mut cmd = Command::new("cybercuris")
+                    .about("Linux password manager")
+                    .arg_required_else_help(true);
+                cmd.print_help()?;
+                Ok(())
             }
         }
-        Some(("init", _)) => cli_init(),
+        Some(("init", sub_m)) => cli_init(sub_m),
         Some(("store", sub_m)) => cli_store(sub_m),
         Some(("get", sub_m)) => cli_get(sub_m),
         Some(("clip", sub_m)) => cli_clip(sub_m),
@@ -387,15 +423,24 @@ fn read_password(name: &str) -> anyhow::Result<PasswordBuf> {
     Ok(PasswordBuf::new(&pass)?)
 }
 
-fn cli_init() -> anyhow::Result<()> {
+fn cli_init(matches: &clap::ArgMatches) -> anyhow::Result<()> {
+    FORCE_TTY.store(true, Ordering::Relaxed);
     let keystore = Keystore::new()?;
-    let password = prompt_set_password()?;
+
+    if keystore.is_initialized() && !matches.get_flag("force") {
+        println!("Password store already initialized.");
+        println!("Use --force to reinitialize (will overwrite existing main key).");
+        return Ok(());
+    }
+
+    let password = prompt_set_password_tty()?;
     keystore.init_main_key(&password)?;
     println!("Main key initialized.");
     Ok(())
 }
 
 fn cli_store(matches: &clap::ArgMatches) -> anyhow::Result<()> {
+    FORCE_TTY.store(true, Ordering::Relaxed);
     let name = matches.get_one::<String>("NAME").unwrap();
     let keystore = Keystore::new()?;
     let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey {
@@ -416,6 +461,7 @@ fn cli_store(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 }
 
 fn cli_get(matches: &clap::ArgMatches) -> anyhow::Result<()> {
+    FORCE_TTY.store(true, Ordering::Relaxed);
     let name = matches.get_one::<String>("NAME").unwrap();
     let keystore = Keystore::new()?;
     let ciphertext = keystore.read_password_ciphertext(name)?;
@@ -440,6 +486,7 @@ fn cli_get(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 }
 
 fn cli_clip(matches: &clap::ArgMatches) -> anyhow::Result<()> {
+    FORCE_TTY.store(true, Ordering::Relaxed);
     let name = matches.get_one::<String>("NAME").unwrap();
     let keystore = Keystore::new()?;
     let ciphertext = keystore.read_password_ciphertext(name)?;
