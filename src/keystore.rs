@@ -57,7 +57,8 @@ impl Keystore {
 
         let mut salt = [0u8; PBKDF2_SALT_LEN];
         rand::rng().fill_bytes(&mut salt);
-        let aes_key = derive_key_from_password(password, &salt, PBKDF2_ITERATIONS);
+        let aes_key =
+            derive_key_from_password(password, &salt, PBKDF2_ITERATIONS);
         let cipher = Aes256Gcm::new(&aes_key);
         let mut nonce_bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_bytes);
@@ -67,9 +68,9 @@ impl Keystore {
             .context("encrypting main key")?;
 
         let path = self.main_key_path();
-        write_new_format(&nonce, &salt, &ciphertext, &path)?;
-
+        let result = write_new_format(&nonce, &salt, &ciphertext, &path);
         unsafe { clear_memory(&mut main_key) };
+        result?;
 
         Ok(())
     }
@@ -100,7 +101,11 @@ impl Keystore {
                 // the existing file.
                 let mut salt = [0u8; PBKDF2_SALT_LEN];
                 rand::rng().fill_bytes(&mut salt);
-                let new_aes_key = derive_key_from_password(password, &salt, PBKDF2_ITERATIONS);
+                let new_aes_key = derive_key_from_password(
+                    password,
+                    &salt,
+                    PBKDF2_ITERATIONS,
+                );
                 let cipher = Aes256Gcm::new(&new_aes_key);
                 let mut nonce_bytes = [0u8; 12];
                 rand::rng().fill_bytes(&mut nonce_bytes);
@@ -109,23 +114,31 @@ impl Keystore {
                     .encrypt(&nonce, plain.as_slice())
                     .context("re-encrypting main key during migration")?;
 
+                // Move plain into MemoryGuard before the atomic write,
+                // so it gets zeroed on drop even if the write fails.
+                let guard = into_memory_guard(plain)?;
                 let path = self.main_key_path();
                 write_new_format_atomic(&nonce, &salt, &new_ct, &path)?;
 
-                let guard = into_memory_guard(plain)?;
                 Ok(guard)
             }
             NEW_FILE_SIZE => {
                 // Current format: nonce(12) || salt(32) || ciphertext.
                 let nonce = &data[..12];
-                let user_salt: &[u8; PBKDF2_SALT_LEN] = data[12..12 + PBKDF2_SALT_LEN]
+                let user_salt: &[u8; PBKDF2_SALT_LEN] = data
+                    [12..12 + PBKDF2_SALT_LEN]
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("corrupt salt"))?;
-                let aes_key =
-                    derive_key_from_password(password, user_salt, PBKDF2_ITERATIONS);
+                let aes_key = derive_key_from_password(
+                    password,
+                    user_salt,
+                    PBKDF2_ITERATIONS,
+                );
 
-                // Rebuild [nonce || ciphertext] for the existing decrypt helper.
-                let mut combined = Vec::with_capacity(12 + data.len() - 12 - PBKDF2_SALT_LEN);
+                // Rebuild [nonce || ciphertext] for the existing decrypt
+                // helper.
+                let mut combined =
+                    Vec::with_capacity(12 + data.len() - 12 - PBKDF2_SALT_LEN);
                 combined.extend_from_slice(nonce);
                 combined.extend_from_slice(&data[12 + PBKDF2_SALT_LEN..]);
                 let plain = decrypt_data(&aes_key, &combined)
@@ -153,6 +166,13 @@ impl Keystore {
             .context("encrypting password")?;
 
         let path = self.password_path(name);
+        // If a legacy file exists under the same (or a colliding) name,
+        // remove it so we don't leave orphans.
+        if let Some(legacy) = self.legacy_password_path(name)
+            && legacy != path
+        {
+            let _ = fs::remove_file(&legacy);
+        }
         write_with_nonce(&nonce, &ciphertext, &path)
     }
 
@@ -160,16 +180,30 @@ impl Keystore {
         &self,
         name: &str,
     ) -> anyhow::Result<Vec<u8>> {
-        fs::read(self.password_path(name)).context("reading encrypted password")
+        let path = self
+            .resolve_password_path(name)
+            .ok_or_else(|| anyhow::anyhow!("Password not found: {name}"))?;
+        fs::read(&path)
+            .with_context(|| format!("reading encrypted password for {name}"))
     }
 
     pub(crate) fn has_password(&self, name: &str) -> bool {
-        self.password_path(name).exists()
+        self.resolve_password_path(name).is_some()
     }
 
     pub(crate) fn remove_password(&self, name: &str) -> anyhow::Result<()> {
-        fs::remove_file(self.password_path(name))
-            .with_context(|| format!("removing password for {name}"))
+        let path = self
+            .resolve_password_path(name)
+            .ok_or_else(|| anyhow::anyhow!("Password not found: {name}"))?;
+        fs::remove_file(&path)
+            .with_context(|| format!("removing password for {name}"))?;
+        // Also clean up a possible legacy duplicate.
+        if let Some(legacy) = self.legacy_password_path(name)
+            && legacy != path
+        {
+            let _ = fs::remove_file(&legacy);
+        }
+        Ok(())
     }
 
     pub(crate) fn rename_password(
@@ -177,14 +211,31 @@ impl Keystore {
         old_name: &str,
         new_name: &str,
     ) -> anyhow::Result<()> {
-        fs::rename(self.password_path(old_name), self.password_path(new_name))
-            .with_context(|| {
-                format!("renaming password {old_name} to {new_name}")
-            })
+        let old_path = self
+            .resolve_password_path(old_name)
+            .ok_or_else(|| anyhow::anyhow!("Password not found: {old_name}"))?;
+        let new_path = self.password_path(new_name);
+        fs::rename(&old_path, &new_path).with_context(|| {
+            format!("renaming password {old_name} to {new_name}")
+        })?;
+        // Clean up legacy duplicates for both old and new names.
+        if let Some(legacy) = self.legacy_password_path(old_name)
+            && legacy != old_path
+            && legacy != new_path
+        {
+            let _ = fs::remove_file(&legacy);
+        }
+        if let Some(legacy) = self.legacy_password_path(new_name)
+            && legacy != new_path
+        {
+            let _ = fs::remove_file(&legacy);
+        }
+        Ok(())
     }
 
     pub(crate) fn list_passwords(&self) -> anyhow::Result<Vec<String>> {
         let dir = self.data_dir.join("passwords");
+        let mut seen = std::collections::HashSet::new();
         let mut names = vec![];
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
@@ -197,19 +248,56 @@ impl Keystore {
             let entry = entry?;
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "key")
-                && let Some(name) = path.file_stem().and_then(|s| s.to_str())
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
             {
-                names.push(name.to_string());
+                // Use the file stem directly as the listed name.  Since
+                // filenames are collision-free (hex-encoded), different
+                // passwords always produce distinct file stems.
+                if seen.insert(stem.to_string()) {
+                    names.push(stem.to_string());
+                }
             }
         }
         names.sort();
         Ok(names)
     }
 
+    /// Primary (collision-free) filename for `name`.
     fn password_path(&self, name: &str) -> PathBuf {
         self.data_dir
             .join("passwords")
             .join(format!("{}.key", sanitize_filename(name)))
+    }
+
+    /// Legacy filename (old `_`-only encoding) for `name`, if it
+    /// differs from the current encoding.
+    fn legacy_password_path(&self, name: &str) -> Option<PathBuf> {
+        let current = sanitize_filename(name);
+        let legacy = sanitize_filename_legacy(name);
+        if legacy != current {
+            Some(
+                self.data_dir
+                    .join("passwords")
+                    .join(format!("{}.key", legacy)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Return the path to an existing password file, trying the
+    /// collision-free encoding first, then the legacy encoding.
+    fn resolve_password_path(&self, name: &str) -> Option<PathBuf> {
+        let primary = self.password_path(name);
+        if primary.exists() {
+            return Some(primary);
+        }
+        if let Some(legacy) = self.legacy_password_path(name)
+            && legacy.exists()
+        {
+            return Some(legacy);
+        }
+        None
     }
 }
 
@@ -333,7 +421,28 @@ fn derive_key_from_main_key(main_key: &[u8]) -> Key<Aes256Gcm> {
     key.into()
 }
 
+/// Encode a password name into a collision-free filename.
+///
+/// Allowed characters pass through unchanged.  Every other character is
+/// encoded as `_XX_` (lowercase hex) so that different names never map
+/// to the same filename (e.g. `a/b` → `a_2f_b.key` is distinct from
+/// `a_b` → `a_b.key`).
 fn sanitize_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+            out.push(c);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "_{:02x}_", c as u32);
+        }
+    }
+    out
+}
+
+/// Legacy sanitisation kept for reading old-format filenames that were
+/// created before the collision-free encoding was introduced.
+fn sanitize_filename_legacy(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {

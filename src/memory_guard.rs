@@ -47,7 +47,11 @@ impl MemoryGuard {
             return Ok(MemoryGuard(Vec::new()));
         }
         let v = vec![0u8; size];
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return Err(std::io::Error::other("sysconf(_SC_PAGESIZE) failed"));
+        }
+        let page_size = page_size as usize;
         let base = v.as_ptr() as usize;
         let aligned = base & !(page_size - 1);
         let end = base + size;
@@ -89,7 +93,13 @@ impl Drop for MemoryGuard {
         if len == 0 {
             return;
         }
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            // Best-effort zero without munlock.
+            unsafe { clear_memory(&mut self.0) };
+            return;
+        }
+        let page_size = page_size as usize;
         let base = self.0.as_ptr() as usize;
         let aligned = base & !(page_size - 1);
         let end = base + len;

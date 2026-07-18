@@ -41,6 +41,8 @@ pub(crate) fn try_activate_existing() -> bool {
 pub(crate) struct InstanceGuard {
     thread_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     shutdown: Arc<AtomicBool>,
+    /// Set to true once the GUI event loop is running.
+    event_loop_ready: Arc<AtomicBool>,
 }
 
 impl Drop for InstanceGuard {
@@ -61,6 +63,14 @@ impl Drop for InstanceGuard {
     }
 }
 
+impl InstanceGuard {
+    /// Signal that the event loop has started so the listener can
+    /// safely invoke `slint::invoke_from_event_loop`.
+    pub(crate) fn set_event_loop_ready(&self) {
+        self.event_loop_ready.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Starts listening on the socket. Returns a guard that cleans up on drop.
 /// `show_window` will be called (via slint::invoke_from_event_loop) when
 /// a second instance wants to show the window.
@@ -69,10 +79,12 @@ pub(crate) fn start_listener(
 ) -> InstanceGuard {
     let show_window: ShowCallback = show_window;
     let shutdown = Arc::new(AtomicBool::new(false));
+    let event_loop_ready = Arc::new(AtomicBool::new(false));
     let thread_handle = Arc::new(Mutex::new(None::<thread::JoinHandle<()>>));
 
     let shutdown_clone = shutdown.clone();
     let thread_handle_clone = thread_handle.clone();
+    let event_loop_ready_clone = event_loop_ready.clone();
 
     let handle = thread::spawn(move || {
         let path = socket_path();
@@ -104,7 +116,11 @@ pub(crate) fn start_listener(
 
             match listener.accept() {
                 Ok((stream, _addr)) => {
-                    handle_connection(stream, show_window.clone());
+                    handle_connection(
+                        stream,
+                        show_window.clone(),
+                        event_loop_ready_clone.clone(),
+                    );
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(polling_interval);
@@ -125,6 +141,7 @@ pub(crate) fn start_listener(
     InstanceGuard {
         thread_handle: thread_handle_clone,
         shutdown,
+        event_loop_ready,
     }
 }
 
@@ -165,13 +182,26 @@ fn bind_socket(path: &std::path::Path) -> std::io::Result<UnixListener> {
     }
 }
 
-fn handle_connection(stream: UnixStream, show_window: ShowCallback) {
+fn handle_connection(
+    stream: UnixStream,
+    show_window: ShowCallback,
+    event_loop_ready: Arc<AtomicBool>,
+) {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     if reader.read_line(&mut line).is_ok() {
         let cmd = line.trim();
         if cmd == "show" {
-            // Use slint::invoke_from_event_loop from any thread.
+            // Wait (with bounded retries) for the event loop to start
+            // so that `invoke_from_event_loop` succeeds.
+            let max_wait = std::time::Duration::from_secs(5);
+            let poll = std::time::Duration::from_millis(50);
+            let deadline = std::time::Instant::now() + max_wait;
+            while !event_loop_ready.load(Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(poll);
+            }
             let _ = slint::invoke_from_event_loop(move || {
                 show_window();
             });

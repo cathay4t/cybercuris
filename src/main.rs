@@ -121,25 +121,45 @@ fn read_password_tty(prompt: &str) -> anyhow::Result<PasswordBuf> {
     use std::os::fd::AsRawFd;
 
     let stdin_fd = io::stdin().as_raw_fd();
+    let is_tty = unsafe { libc::isatty(stdin_fd) != 0 };
 
-    // Save current terminal settings and disable echo.
-    let saved_term = unsafe {
-        let mut term: libc::termios = std::mem::zeroed();
-        libc::tcgetattr(stdin_fd, &mut term);
-        let saved = term;
-        term.c_lflag &= !libc::ECHO;
-        libc::tcsetattr(stdin_fd, libc::TCSANOW, &term);
-        saved
+    // Save current terminal settings and disable echo (only if a TTY).
+    let saved_term = if is_tty {
+        let saved = unsafe {
+            let mut term: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(stdin_fd, &mut term) != 0 {
+                return Err(anyhow::anyhow!(
+                    "tcgetattr failed: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            let saved = term;
+            term.c_lflag &= !libc::ECHO;
+            if libc::tcsetattr(stdin_fd, libc::TCSANOW, &term) != 0 {
+                return Err(anyhow::anyhow!(
+                    "tcsetattr failed: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            saved
+        };
+        Some(saved)
+    } else {
+        None
     };
 
     let result = (|| -> anyhow::Result<PasswordBuf> {
-        eprint!("{prompt}: ");
-        io::stderr().flush().ok();
+        if is_tty {
+            eprint!("{prompt}: ");
+            io::stderr().flush().ok();
+        }
         let mut pass = String::new();
         io::stdin()
             .read_line(&mut pass)
             .context("reading password from stdin")?;
-        eprintln!();
+        if is_tty {
+            eprintln!();
+        }
         let mut pass = pass.trim_end_matches(&['\n', '\r'][..]).to_owned();
         let buf = PasswordBuf::new(&pass)?;
         zero_string(&mut pass);
@@ -147,8 +167,15 @@ fn read_password_tty(prompt: &str) -> anyhow::Result<PasswordBuf> {
     })();
 
     // Restore terminal settings.
-    unsafe {
-        libc::tcsetattr(stdin_fd, libc::TCSANOW, &saved_term);
+    if let Some(saved_term) = saved_term {
+        let restore_result =
+            unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &saved_term) };
+        if restore_result != 0 {
+            eprintln!(
+                "Warning: failed to restore terminal settings: {}",
+                io::Error::last_os_error()
+            );
+        }
     }
 
     result
@@ -166,11 +193,15 @@ fn prompt_unlock_password_gui() -> anyhow::Result<PasswordBuf> {
     let dialog = ui::UnlockDialog::new()?;
     slint::set_xdg_app_id(slint::SharedString::from("cybercuris"))?;
     let (tx, rx) = std::sync::mpsc::channel();
+    let pending_timers: std::rc::Rc<
+        std::cell::RefCell<Vec<Box<slint::Timer>>>,
+    > = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
     let dlg_weak = dialog.as_weak();
     let do_confirm = {
         let dlg_weak = dlg_weak.clone();
         let tx = tx.clone();
+        let timers = pending_timers.clone();
         move || {
             let password = if let Some(dlg) = dlg_weak.upgrade() {
                 let p = dlg.get_password_text().to_string();
@@ -188,31 +219,37 @@ fn prompt_unlock_password_gui() -> anyhow::Result<PasswordBuf> {
                     let _ = slint::quit_event_loop();
                 },
             );
-            Box::leak(timer);
+            timers.borrow_mut().push(timer);
         }
     };
 
     dialog.on_accepted(do_confirm.clone());
     dialog.on_ok_clicked(do_confirm);
 
-    dialog.on_cancel_clicked(move || {
-        if let Some(dlg) = dlg_weak.upgrade() {
-            dlg.hide().ok();
+    dialog.on_cancel_clicked({
+        let dlg_weak = dlg_weak.clone();
+        let timers = pending_timers.clone();
+        move || {
+            if let Some(dlg) = dlg_weak.upgrade() {
+                dlg.hide().ok();
+            }
+            let _ = tx.send(String::new());
+            let timer = Box::new(slint::Timer::default());
+            timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(50),
+                move || {
+                    let _ = slint::quit_event_loop();
+                },
+            );
+            timers.borrow_mut().push(timer);
         }
-        let _ = tx.send(String::new());
-        let timer = Box::new(slint::Timer::default());
-        timer.start(
-            slint::TimerMode::SingleShot,
-            Duration::from_millis(50),
-            move || {
-                let _ = slint::quit_event_loop();
-            },
-        );
-        Box::leak(timer);
     });
 
     dialog.show()?;
     slint::run_event_loop()?;
+
+    drop(pending_timers);
 
     let mut password = rx
         .recv()
@@ -262,6 +299,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn prompt_set_password_gui() -> anyhow::Result<PasswordBuf> {
     slint::set_xdg_app_id(slint::SharedString::from("cybercuris"))?;
 
+    // Collect timers from all loop iterations so we can drop them
+    // cleanly instead of leaking them via Box::leak.
+    let pending_timers: std::rc::Rc<
+        std::cell::RefCell<Vec<Box<slint::Timer>>>,
+    > = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+
     loop {
         let dialog = ui::SetPasswordDialog::new()?;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -270,6 +313,7 @@ fn prompt_set_password_gui() -> anyhow::Result<PasswordBuf> {
         let do_confirm = {
             let dlg_weak = dlg_weak.clone();
             let tx = tx.clone();
+            let timers = pending_timers.clone();
             move || {
                 let (p1, p2) = if let Some(dlg) = dlg_weak.upgrade() {
                     let p1 = dlg.get_password1().to_string();
@@ -288,27 +332,31 @@ fn prompt_set_password_gui() -> anyhow::Result<PasswordBuf> {
                         let _ = slint::quit_event_loop();
                     },
                 );
-                Box::leak(timer);
+                timers.borrow_mut().push(timer);
             }
         };
 
         dialog.on_accepted(do_confirm.clone());
         dialog.on_ok_clicked(do_confirm);
 
-        dialog.on_cancel_clicked(move || {
-            if let Some(dlg) = dlg_weak.upgrade() {
-                dlg.hide().ok();
+        dialog.on_cancel_clicked({
+            let dlg_weak = dlg_weak.clone();
+            let timers = pending_timers.clone();
+            move || {
+                if let Some(dlg) = dlg_weak.upgrade() {
+                    dlg.hide().ok();
+                }
+                let _ = tx.send((String::new(), String::new()));
+                let timer = Box::new(slint::Timer::default());
+                timer.start(
+                    slint::TimerMode::SingleShot,
+                    Duration::from_millis(50),
+                    move || {
+                        let _ = slint::quit_event_loop();
+                    },
+                );
+                timers.borrow_mut().push(timer);
             }
-            let _ = tx.send((String::new(), String::new()));
-            let timer = Box::new(slint::Timer::default());
-            timer.start(
-                slint::TimerMode::SingleShot,
-                Duration::from_millis(50),
-                move || {
-                    let _ = slint::quit_event_loop();
-                },
-            );
-            Box::leak(timer);
         });
 
         dialog.show()?;
@@ -535,12 +583,22 @@ fn cli_store(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
     let password = read_password(name)?;
 
-    with_main_key(&cached, |mk| {
-        keystore.store_password(name, password.as_bytes(), mk).ok();
+    let stored = with_main_key(&cached, |mk| {
+        keystore.store_password(name, password.as_bytes(), mk)
     });
 
-    println!("Stored password for {name}.");
-    Ok(())
+    match stored {
+        Some(Ok(())) => {
+            println!("Stored password for {name}.");
+            Ok(())
+        }
+        Some(Err(e)) => {
+            anyhow::bail!("Failed to store password for {name}: {e:#}")
+        }
+        None => {
+            anyhow::bail!("Key expired — please unlock again")
+        }
+    }
 }
 
 fn cli_get(matches: &clap::ArgMatches) -> anyhow::Result<()> {
@@ -554,11 +612,13 @@ fn cli_get(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
     unlock_key_with_init(&keystore, &cached)?;
 
-    let plain = with_main_key(&cached, |mk| {
-        keystore::decrypt_with_main_key(mk, &ciphertext).ok()
-    })
-    .flatten()
-    .ok_or_else(|| anyhow::anyhow!("Failed to decrypt password"))?;
+    let plain = match with_main_key(&cached, |mk| {
+        keystore::decrypt_with_main_key(mk, &ciphertext)
+    }) {
+        Some(Ok(guard)) => guard,
+        Some(Err(e)) => anyhow::bail!("Failed to decrypt password: {e:#}"),
+        None => anyhow::bail!("Key expired — please unlock again"),
+    };
 
     let mut stdout = io::stdout().lock();
     stdout.write_all(plain.as_slice())?;
@@ -606,6 +666,9 @@ fn run_gui() -> anyhow::Result<()> {
     let clipboard: Arc<Mutex<Option<clipboard::ClipboardHandle>>> =
         Arc::new(Mutex::new(None));
     let all_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    // Holds the inactivity timer so it lives for the entire GUI session
+    // without being leaked.
+    let mut _inactivity_timer: Option<Box<slint::Timer>> = None;
 
     let win = ui::MainWindow::new()?;
     slint::set_xdg_app_id(slint::SharedString::from("cybercuris"))?;
@@ -707,9 +770,17 @@ fn run_gui() -> anyhow::Result<()> {
                     let aes_key = keystore::password_aes_key_from_main_key(
                         guard.as_slice(),
                     );
-                    *clipboard.lock().unwrap() = Some(
-                        clipboard::spawn_clipboard_thread(aes_key).unwrap(),
-                    );
+                    match clipboard::spawn_clipboard_thread(aes_key) {
+                        Ok(handle) => {
+                            *clipboard.lock().unwrap() = Some(handle);
+                        }
+                        Err(e) => {
+                            win.set_status(
+                                format!("Clipboard error: {e:#}").into(),
+                            );
+                            return;
+                        }
+                    }
                     cached.lock().unwrap().set(guard);
                     win.set_locked(false);
                     win.set_status("".into());
@@ -757,9 +828,17 @@ fn run_gui() -> anyhow::Result<()> {
                     let aes_key = keystore::password_aes_key_from_main_key(
                         guard.as_slice(),
                     );
-                    *clipboard.lock().unwrap() = Some(
-                        clipboard::spawn_clipboard_thread(aes_key).unwrap(),
-                    );
+                    match clipboard::spawn_clipboard_thread(aes_key) {
+                        Ok(handle) => {
+                            *clipboard.lock().unwrap() = Some(handle);
+                        }
+                        Err(e) => {
+                            win.set_status(
+                                format!("Clipboard error: {e:#}").into(),
+                            );
+                            return;
+                        }
+                    }
                     cached.lock().unwrap().set(guard);
                     win.set_needs_init(false);
                     win.set_locked(false);
@@ -986,7 +1065,7 @@ fn run_gui() -> anyhow::Result<()> {
                 }
             },
         );
-        Box::leak(timer);
+        _inactivity_timer = Some(timer);
     }
 
     // Start single-instance socket listener. When a second instance
@@ -1003,6 +1082,9 @@ fn run_gui() -> anyhow::Result<()> {
     }));
 
     win.show()?;
+    // Signal the listener thread that the event loop is about to run,
+    // so it can safely queue callbacks via slint::invoke_from_event_loop.
+    _guard.set_event_loop_ready();
     slint::run_event_loop_until_quit()?;
 
     Ok(())
