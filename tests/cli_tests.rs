@@ -4,8 +4,13 @@ use std::{
     io::Write,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::Mutex,
     time::{Duration, Instant},
 };
+
+/// Global lock to serialize clipboard tests — the Wayland clipboard
+/// is a per-compositor singleton, so parallel tests interfere.
+static CLIPBOARD_MUTEX: Mutex<()> = Mutex::new(());
 
 fn data_home(name: &str) -> PathBuf {
     std::env::temp_dir().join(name)
@@ -150,6 +155,7 @@ fn test_cli_init_store_get_list() {
 
 #[test]
 fn test_cli_clip() {
+    let _lock = CLIPBOARD_MUTEX.lock().unwrap();
     if !wl_paste_available() {
         eprintln!("SKIP: wl-paste not available");
         return;
@@ -215,6 +221,82 @@ fn test_cli_clip() {
         "Paste took {}ms",
         elapsed.as_millis()
     );
+
+    // Clear clipboard for good measure.
+    let _ = Command::new("wl-copy").arg("--clear").output();
+
+    let _ = fs::remove_dir_all(data_home(home));
+}
+
+#[test]
+fn test_cli_clip_paste_once() {
+    let _lock = CLIPBOARD_MUTEX.lock().unwrap();
+    if !wl_paste_available() {
+        eprintln!("SKIP: wl-paste not available");
+        return;
+    }
+
+    let home = "cybercuris_test_paste_once";
+    let _ = fs::remove_dir_all(data_home(home));
+
+    // drain clipboard before test
+    let _ = wl_paste();
+
+    // init
+    let (_, _, ok) =
+        run_stdin(home, &["-t", "init"], MAIN_PASS_INIT.as_bytes());
+    assert!(ok);
+
+    // store
+    let entry_pass = "once_secret99";
+    let input = format!("{MAIN_PASS}{entry_pass}\n");
+    let (_, _, ok) =
+        run_stdin(home, &["-t", "store", "once_test"], input.as_bytes());
+    assert!(ok);
+
+    // clip
+    let mut clip = cmd_with_home(home);
+    clip.args(["-t", "clip", "once_test"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = clip.spawn().expect("spawn clip");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(MAIN_PASS.as_bytes())
+        .unwrap();
+
+    // Wait for PBKDF2 + Wayland roundtrip + selection setup
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // First paste: should get the password.
+    let mut pasted = String::new();
+    for _ in 0..10 {
+        pasted = wl_paste().trim().to_string();
+        if pasted == entry_pass {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        pasted, entry_pass,
+        "first paste should return the password, got '{pasted}'"
+    );
+
+    // Second paste: must be empty (paste-once enforcement).
+    let second = wl_paste().trim().to_string();
+    assert!(
+        second.is_empty(),
+        "second paste must be empty (paste-once), got '{second}'"
+    );
+
+    let output = child.wait_with_output().unwrap();
+    drop(output);
+
+    // Clear clipboard for good measure.
+    let _ = Command::new("wl-copy").arg("--clear").output();
 
     let _ = fs::remove_dir_all(data_home(home));
 }

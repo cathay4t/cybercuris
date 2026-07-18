@@ -2,11 +2,13 @@
 use std::{
     cell::RefCell,
     io::{self, Write},
+    os::fd::RawFd,
     rc::Rc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -19,15 +21,31 @@ use crate::{
     memory_guard::{MemoryGuard, PasswordBuf},
 };
 
+/// Write end of the self-pipe. The SIGUSR1 handler writes a byte here.
+static mut SIGUSR1_PIPE_WRITE: RawFd = -1;
+/// Read end of the self-pipe. Used by the watcher thread.
+static mut SIGUSR1_PIPE_READ: RawFd = -1;
+/// Atomic flag for CLI subcommands (no event loop to watch the pipe).
 static SIGUSR1_RECEIVED: AtomicBool = AtomicBool::new(false);
 static FORCE_TTY: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigusr1(_sig: libc::c_int) {
     SIGUSR1_RECEIVED.store(true, Ordering::SeqCst);
+    let byte: [u8; 1] = [1];
+    unsafe {
+        if SIGUSR1_PIPE_WRITE >= 0 {
+            libc::write(
+                SIGUSR1_PIPE_WRITE,
+                byte.as_ptr() as *const libc::c_void,
+                1,
+            );
+        }
+    }
 }
 
-fn setup_signal_handler() {
+fn setup_signal_handler(pipe_write: RawFd) {
     unsafe {
+        SIGUSR1_PIPE_WRITE = pipe_write;
         libc::signal(
             libc::SIGUSR1,
             handle_sigusr1 as *const () as libc::sighandler_t,
@@ -329,7 +347,17 @@ where
 }
 
 fn main() -> anyhow::Result<()> {
-    setup_signal_handler();
+    let mut pipe_fds = [0i32; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        anyhow::bail!(
+            "failed to create signal pipe: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    unsafe {
+        SIGUSR1_PIPE_READ = pipe_fds[0];
+    }
+    setup_signal_handler(pipe_fds[1]);
 
     let matches = Command::new("cybercuris")
         .about("Linux password manager")
@@ -392,6 +420,11 @@ fn main() -> anyhow::Result<()> {
             // No subcommand: launch GUI if WAYLAND_DISPLAY is set,
             // otherwise print help.
             if has_wayland() {
+                // Check for existing instance — if found, tell it to
+                // show its window and exit.
+                if single_instance::try_activate_existing() {
+                    return Ok(());
+                }
                 run_gui()
             } else {
                 let mut cmd = Command::new("cybercuris")
@@ -523,8 +556,8 @@ fn run_gui() -> anyhow::Result<()> {
         key: None,
         loaded_at: None,
     }));
-    let clipboard: Rc<RefCell<Option<clipboard::ClipboardHandle>>> =
-        Rc::new(RefCell::new(None));
+    let clipboard: Arc<Mutex<Option<clipboard::ClipboardHandle>>> =
+        Arc::new(Mutex::new(None));
     let all_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
     let win = ui::MainWindow::new()?;
@@ -539,6 +572,8 @@ fn run_gui() -> anyhow::Result<()> {
         let win_weak = win.as_weak();
         tray.on_show_window(move || {
             if let Some(win) = win_weak.upgrade() {
+                win.set_filter_text("".into());
+                win.invoke_filter_changed("".into());
                 let _ = win.show();
             }
         });
@@ -568,7 +603,7 @@ fn run_gui() -> anyhow::Result<()> {
                     let aes_key = keystore::password_aes_key_from_main_key(
                         guard.as_slice(),
                     );
-                    *clipboard.borrow_mut() = Some(
+                    *clipboard.lock().unwrap() = Some(
                         clipboard::spawn_clipboard_thread(aes_key).unwrap(),
                     );
                     cached.lock().unwrap().set(guard);
@@ -618,7 +653,7 @@ fn run_gui() -> anyhow::Result<()> {
                     let aes_key = keystore::password_aes_key_from_main_key(
                         guard.as_slice(),
                     );
-                    *clipboard.borrow_mut() = Some(
+                    *clipboard.lock().unwrap() = Some(
                         clipboard::spawn_clipboard_thread(aes_key).unwrap(),
                     );
                     cached.lock().unwrap().set(guard);
@@ -640,7 +675,7 @@ fn run_gui() -> anyhow::Result<()> {
         let win_weak = win.as_weak();
         win.on_lock(move || {
             cached.lock().unwrap().drop_key();
-            *clipboard.borrow_mut() = None;
+            *clipboard.lock().unwrap() = None;
             if let Some(win) = win_weak.upgrade() {
                 win.set_locked(true);
                 win.set_status("".into());
@@ -755,6 +790,59 @@ fn run_gui() -> anyhow::Result<()> {
     win.window()
         .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
+    // Spawn a thread that blocks on the self-pipe read end.
+    // When SIGUSR1 fires, the handler writes a byte, waking this
+    // thread which dispatches the full lock action via
+    // slint::invoke_from_event_loop — zero polling, instant response.
+    {
+        let cached = cached.clone();
+        let clipboard = clipboard.clone();
+        let win_weak = win.as_weak();
+        let pipe_read = unsafe { SIGUSR1_PIPE_READ };
+        thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            loop {
+                let n = unsafe {
+                    libc::read(
+                        pipe_read,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n <= 0 {
+                    break;
+                }
+                let _ = slint::invoke_from_event_loop({
+                    let cached = cached.clone();
+                    let clipboard = clipboard.clone();
+                    let win_weak = win_weak.clone();
+                    move || {
+                        cached.lock().unwrap().drop_key();
+                        *clipboard.lock().unwrap() = None;
+                        if let Some(win) = win_weak.upgrade() {
+                            win.set_locked(true);
+                            win.set_status("".into());
+                            win.window().hide().ok();
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    // Start single-instance socket listener. When a second instance
+    // launches, it will trigger this callback to show the main window.
+    let _guard = single_instance::start_listener(Arc::new({
+        let win_weak = win.as_weak();
+        move || {
+            if let Some(win) = win_weak.upgrade() {
+                win.set_filter_text("".into());
+                win.invoke_filter_changed("".into());
+                let _ = win.show();
+            }
+        }
+    }));
+
     win.show()?;
     slint::run_event_loop_until_quit()?;
 
@@ -770,7 +858,7 @@ fn copy_password(app: &mut App, win: &ui::MainWindow, name: &str) {
         }
     };
 
-    if let Some(ref clip) = *app.clipboard.borrow() {
+    if let Some(ref clip) = *app.clipboard.lock().unwrap() {
         clip.hold(ciphertext);
         win.set_status(format!("Copied {name} to clipboard.").into());
     }
@@ -833,7 +921,7 @@ fn refresh(app: &mut App, win: &ui::MainWindow) {
 
 struct App {
     keystore: Rc<Keystore>,
-    clipboard: Rc<RefCell<Option<clipboard::ClipboardHandle>>>,
+    clipboard: Arc<Mutex<Option<clipboard::ClipboardHandle>>>,
     cached: Arc<Mutex<CachedKey>>,
     names: Vec<String>,
 }
@@ -841,4 +929,5 @@ struct App {
 mod clipboard;
 mod keystore;
 mod memory_guard;
+mod single_instance;
 mod ui;

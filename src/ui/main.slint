@@ -26,7 +26,12 @@ export component MainWindow inherits Window {
     FocusScope {
         key-pressed(event) => {
             if event.text == "\u{001b}" {
-                root.hide-window();
+                if root.filter-text == "" {
+                    root.hide-window();
+                } else {
+                    root.filter-text = "";
+                    root.filter-changed("");
+                }
                 return accept;
             }
             reject

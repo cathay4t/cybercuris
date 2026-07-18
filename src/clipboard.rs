@@ -243,6 +243,7 @@ fn set_selection(
     state.source = Some(source);
     state.held = Some(ciphertext);
     state.done_tx = done;
+    state.send_count = 0;
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ClipboardState {
@@ -336,8 +337,9 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ClipboardState {
                     let _ = file.flush();
                     drop(file);
                     state.send_count += 1;
-                    if state.send_count >= 2 {
-                        // Paste-once: drop ciphertext after full paste cycle
+                    // Paste-once: drop ciphertext after both MIME
+                    // types have been served (one paste operation).
+                    if state.send_count >= MIME_TYPES.len() as u32 {
                         state.held = None;
                         if let Some(tx) = state.done_tx.take() {
                             let _ = tx.send(());
