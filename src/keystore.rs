@@ -263,7 +263,7 @@ impl Keystore {
     }
 
     /// Primary (collision-free) filename for `name`.
-    fn password_path(&self, name: &str) -> PathBuf {
+    pub(crate) fn password_path(&self, name: &str) -> PathBuf {
         self.data_dir
             .join("passwords")
             .join(format!("{}.key", sanitize_filename(name)))

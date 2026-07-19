@@ -504,6 +504,22 @@ fn main() -> anyhow::Result<()> {
                 ),
         )
         .subcommand(Command::new("list").about("List stored password names"))
+        .subcommand(Command::new("backup").about(
+            "Export all passwords as an encrypted YAML backup to stdout",
+        ))
+        .subcommand(
+            Command::new("restore")
+                .about(
+                    "Restore passwords from an encrypted YAML backup on stdin",
+                )
+                .arg(
+                    Arg::new("force")
+                        .short('f')
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help("Force restore even if data already exists"),
+                ),
+        )
         .get_matches();
 
     if matches.get_flag("tty") {
@@ -534,6 +550,8 @@ fn main() -> anyhow::Result<()> {
         Some(("get", sub_m)) => cli_get(sub_m),
         Some(("clip", sub_m)) => cli_clip(sub_m),
         Some(("list", _)) => cli_list(),
+        Some(("backup", _)) => cli_backup(),
+        Some(("restore", sub_m)) => cli_restore(sub_m),
         Some((cmd, _)) => {
             anyhow::bail!("Unknown command: {cmd}");
         }
@@ -658,6 +676,20 @@ fn cli_list() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cli_backup() -> anyhow::Result<()> {
+    FORCE_TTY.store(true, Ordering::Relaxed);
+    let keystore = Keystore::new()?;
+    let settings = settings::Settings::load();
+    backup::backup(&keystore, &settings)
+}
+
+fn cli_restore(matches: &clap::ArgMatches) -> anyhow::Result<()> {
+    FORCE_TTY.store(true, Ordering::Relaxed);
+    let keystore = Keystore::new()?;
+    let force = matches.get_flag("force");
+    backup::restore(&keystore, force)
+}
+
 fn run_gui() -> anyhow::Result<()> {
     let keystore = Rc::new(Keystore::new()?);
     let settings = Rc::new(RefCell::new(settings::Settings::load()));
@@ -730,6 +762,123 @@ fn run_gui() -> anyhow::Result<()> {
             win.set_hide_shortcut_key(hide_key.as_str().into());
             win.set_settings_timeout_minutes(minutes.to_string().into());
             win.set_status("Settings saved.".into());
+        });
+    }
+
+    {
+        let keystore = keystore.clone();
+        let settings = settings.clone();
+        let win_weak = win.as_weak();
+        win.on_backup_pressed(move || {
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
+            let yaml =
+                match backup::backup_to_string(&keystore, &settings.borrow()) {
+                    Ok(y) => y,
+                    Err(e) => {
+                        win.set_status(format!("Backup error: {e:#}").into());
+                        return;
+                    }
+                };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            // Use chrono-style decomposition to build a timestamp string
+            // without pulling in a chrono dependency.
+            let days = secs / 86400;
+            let (year, month, day) = civil_from_days(days as i64);
+            let remaining = secs % 86400;
+            let hour = remaining / 3600;
+            let minute = (remaining % 3600) / 60;
+            let second = remaining % 60;
+            let filename = format!(
+                "cybercuris-backup-{}-{:02}-{:02}-{:02}-{:02}-{:02}.yaml",
+                year, month, day, hour, minute, second
+            );
+            let path = match rfd::FileDialog::new()
+                .set_title("Save Backup")
+                .set_file_name(&filename)
+                .add_filter("YAML", &["yaml", "yml"])
+                .save_file()
+            {
+                Some(p) => p,
+                None => {
+                    win.set_status("Backup cancelled.".into());
+                    return;
+                }
+            };
+            match std::fs::write(&path, yaml.as_bytes()) {
+                Ok(()) => {
+                    win.set_status(
+                        format!("Backed up to {}", path.display()).into(),
+                    );
+                }
+                Err(e) => {
+                    win.set_status(format!("Backup write error: {e}").into());
+                }
+            }
+        });
+    }
+
+    {
+        let keystore = keystore.clone();
+        let settings = settings.clone();
+        let cached = cached.clone();
+        let clipboard = clipboard.clone();
+        let all_names = all_names.clone();
+        let win_weak = win.as_weak();
+        win.on_restore_pressed(move || {
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
+            let path = match rfd::FileDialog::new()
+                .set_title("Open Backup File")
+                .add_filter("YAML", &["yaml", "yml"])
+                .pick_file()
+            {
+                Some(p) => p,
+                None => {
+                    win.set_status("Restore cancelled.".into());
+                    return;
+                }
+            };
+            let yaml_str = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    win.set_status(format!("Restore read error: {e}").into());
+                    return;
+                }
+            };
+            match backup::restore_from_str(&keystore, &yaml_str, true) {
+                Ok(()) => {
+                    // Reload settings from disk (written by restore).
+                    let s = settings::Settings::load();
+                    cached.lock().unwrap().set_timeout(s.timeout());
+                    win.set_quit_shortcut_key(s.quit_key.as_str().into());
+                    win.set_hide_shortcut_key(s.hide_key.as_str().into());
+                    win.set_settings_timeout_minutes(
+                        (s.unlock_timeout_secs / 60).to_string().into(),
+                    );
+                    *settings.borrow_mut() = s;
+                    // Lock the current session since data changed.
+                    cached.lock().unwrap().drop_key();
+                    *clipboard.lock().unwrap() = None;
+                    all_names.borrow_mut().clear();
+                    win.set_locked(true);
+                    win.set_status(
+                        format!(
+                            "Restored from {}. Please unlock.",
+                            path.display()
+                        )
+                        .into(),
+                    );
+                }
+                Err(e) => {
+                    win.set_status(format!("Restore error: {e:#}").into());
+                }
+            }
         });
     }
 
@@ -1227,6 +1376,23 @@ struct App {
     names: Vec<String>,
 }
 
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+/// Uses the Howard Hinnant algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468; // shift epoch to 0000-03-01
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+mod backup;
 mod clipboard;
 mod keystore;
 mod memory_guard;

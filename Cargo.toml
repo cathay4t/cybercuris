@@ -8,11 +8,15 @@ license = "Apache 2.0"
 [dependencies]
 aes-gcm = { path = "/home/fge/Public_Sources/AEADs/aes-gcm" }
 anyhow = "1.0.103"
+base64 = "0.22"
 clap = "4.5"
 dirs = "6.0.0"
 libc = "0.2.186"
 pbkdf2 = "0.13"
 rand = "0.10"
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 sha2 = "0.11"
 slint = "1.17.1"
 tokio = { version = "1.52.4", features = ["rt-multi-thread"] }
@@ -21,3 +25,6 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [build-dependencies]
 slint-build = "1.17.1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -30,6 +30,8 @@ export component MainWindow inherits Window {
     callback set-init-password(p1: string, p2: string);
     callback filter-changed(string);
     callback save-settings(timeout-minutes: string, quit-key: string, hide-key: string);
+    callback backup-pressed();
+    callback restore-pressed();
 
     FocusScope {
         capture-key-pressed(event) => {
@@ -319,6 +321,25 @@ export component MainWindow inherits Window {
                     hide-key-edit := LineEdit {
                         horizontal-stretch: 1;
                         init => { hide-key-edit.text = root.hide-shortcut-key; }
+                    }
+                }
+
+                Text {
+                    text: "Data";
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+
+                HorizontalBox {
+                    spacing: 4px;
+                    alignment: start;
+                    Button {
+                        text: "Backup";
+                        clicked => { root.backup-pressed(); }
+                    }
+                    Button {
+                        text: "Restore";
+                        clicked => { root.restore-pressed(); }
                     }
                 }
 
