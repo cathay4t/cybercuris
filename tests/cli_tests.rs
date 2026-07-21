@@ -193,8 +193,8 @@ fn test_cli_clip() {
         .write_all(MAIN_PASS.as_bytes())
         .unwrap();
 
-    // Wait for PBKDF2 (~0.5s) + Wayland roundtrip + selection setup
-    std::thread::sleep(Duration::from_millis(1500));
+    // Wait for PBKDF2 + Wayland roundtrip + selection setup
+    std::thread::sleep(Duration::from_millis(2000));
 
     let start = Instant::now();
     let mut pasted = String::new();
@@ -269,7 +269,7 @@ fn test_cli_clip_paste_once() {
         .unwrap();
 
     // Wait for PBKDF2 + Wayland roundtrip + selection setup
-    std::thread::sleep(Duration::from_millis(1500));
+    std::thread::sleep(Duration::from_millis(2000));
 
     // First paste: should get the password.
     let mut pasted = String::new();

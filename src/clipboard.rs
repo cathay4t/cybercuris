@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::{io::Write, os::fd::AsRawFd, sync::mpsc};
 
+/// Maximum poll wait (ms) while waiting to tear down the source
+/// after the first paste.  This is NOT a data‑delivery deadline —
+/// the fd write has already completed.  It only bounds how long
+/// we block before the next event‑loop iteration where we destroy
+/// the source.  200 ms is ample for any compositor to process the
+/// fd data; the value is deliberately conservative.
+const PASTE_ONCE_POLL_MS: i32 = 200;
+
 use wayland_client::{
     Connection, Dispatch, QueueHandle,
     globals::{GlobalListContents, registry_queue_init},
@@ -111,7 +119,10 @@ struct ClipboardState {
     held: Option<Vec<u8>>,
     aes_key: [u8; 32],
     done_tx: Option<mpsc::Sender<()>>,
-    send_count: u32,
+    /// Paste-once: set to true on the first Send event.
+    /// On the *next* iteration we destroy the source so
+    /// the compositor has processed our fd write first.
+    pending_destroy: bool,
 }
 
 fn run_clipboard_loop(
@@ -136,7 +147,7 @@ fn run_clipboard_loop(
         held: None,
         aes_key,
         done_tx: None,
-        send_count: 0,
+        pending_destroy: false,
     };
 
     event_queue.roundtrip(&mut state)?;
@@ -144,6 +155,12 @@ fn run_clipboard_loop(
     let qh = event_queue.handle();
 
     while state.running {
+        // Snapshot and clear BEFORE dispatch so a Send that
+        // arrives during this dispatch batch can set its own
+        // flag for the *next* iteration.
+        let should_destroy = state.pending_destroy;
+        state.pending_destroy = false;
+
         event_queue.dispatch_pending(&mut state)?;
 
         loop {
@@ -160,6 +177,16 @@ fn run_clipboard_loop(
             }
         }
 
+        if should_destroy {
+            state.held = None;
+            if let Some(source) = state.source.take() {
+                source.destroy();
+            }
+            if let Some(tx) = state.done_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+
         event_queue.flush()?;
 
         if !state.running {
@@ -171,6 +198,15 @@ fn run_clipboard_loop(
         };
 
         let conn_fd = guard.connection_fd().as_raw_fd();
+
+        // If a Send just set pending_destroy we need to wake
+        // up soon for the destruction pass.  Use a bounded poll
+        // so we don't block indefinitely.
+        let poll_timeout: i32 = if state.pending_destroy {
+            PASTE_ONCE_POLL_MS
+        } else {
+            -1
+        };
 
         let mut poll_fds = [
             libc::pollfd {
@@ -185,7 +221,7 @@ fn run_clipboard_loop(
             },
         ];
 
-        let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, -1) };
+        let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, poll_timeout) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -243,7 +279,7 @@ fn set_selection(
     state.source = Some(source);
     state.held = Some(ciphertext);
     state.done_tx = done;
-    state.send_count = 0;
+    state.pending_destroy = false;
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ClipboardState {
@@ -336,15 +372,10 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ClipboardState {
                     );
                     let _ = file.flush();
                     drop(file);
-                    state.send_count += 1;
-                    // Paste-once: drop ciphertext after both MIME
-                    // types have been served (one paste operation).
-                    if state.send_count >= MIME_TYPES.len() as u32 {
-                        state.held = None;
-                        if let Some(tx) = state.done_tx.take() {
-                            let _ = tx.send(());
-                        }
-                    }
+                    // Paste-once: flag the source for destruction
+                    // on the next event-loop iteration so the
+                    // compositor processes our fd write first.
+                    state.pending_destroy = true;
                 }
             }
             Event::Cancelled => {
