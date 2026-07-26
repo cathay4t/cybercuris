@@ -9,6 +9,16 @@ use std::{io::Write, os::fd::AsRawFd, sync::mpsc};
 /// fd data; the value is deliberately conservative.
 const PASTE_ONCE_POLL_MS: i32 = 200;
 
+/// Maximum time (ms) the startup probe waits for an unsolicited
+/// clipboard read.  A clipboard manager snapshots every new selection,
+/// so it reads our probe almost immediately (observed at well under
+/// 1 ms in practice).  10 ms is a generous ceiling that keeps startup
+/// imperceptibly fast.
+const PROBE_TIMEOUT_MS: i32 = 10;
+
+/// Throwaway, non-sensitive payload published during the probe.
+const PROBE_PAYLOAD: &[u8] = b"cybercuris-clipboard-probe";
+
 use wayland_client::{
     Connection, Dispatch, QueueHandle,
     globals::{GlobalListContents, registry_queue_init},
@@ -25,6 +35,14 @@ use wayland_protocols_wlr::data_control::v1::client::{
 use crate::keystore;
 
 const MIME_TYPES: &[&str] = &["text/plain;charset=utf-8", "text/plain"];
+
+/// User-facing explanation shown when the startup probe detects a
+/// clipboard manager reading the selection automatically.
+pub(crate) const CLIPBOARD_MANAGER_ERROR: &str =
+    "A clipboard manager is reading the clipboard automatically. It would \
+     capture the plaintext password and consume the single paste, so \
+     CyberCuris will not copy. Disable clipboard history/sync (e.g. the \
+     fcitx5 clipboard addon, cliphist, clipman, wl-clip-persist) and retry.";
 
 pub(crate) enum ClipboardJob {
     Hold {
@@ -109,6 +127,99 @@ pub(crate) fn spawn_clipboard_thread(
         sender: tx,
         pipe_write,
     })
+}
+
+/// State for the startup clipboard-manager probe.
+struct ProbeState {
+    /// Set to `true` if an external client read our throwaway selection.
+    consumed: bool,
+}
+
+/// Detect whether a clipboard manager is reading the Wayland selection
+/// automatically.
+///
+/// Publishes a throwaway, non-sensitive selection and watches for an
+/// unsolicited read within [`PROBE_TIMEOUT_MS`].  A clipboard manager
+/// (fcitx5 clipboard addon, cliphist, clipman, wl-clip-persist, …)
+/// snapshots every new selection, so it reads the probe almost
+/// immediately.  Such a manager would both capture the plaintext
+/// password *and* consume CyberCuris's single "paste-once" read, so
+/// the caller must refuse to copy when this returns `Ok(true)`.
+///
+/// Returns:
+/// * `Ok(false)` – clean; no manager consumed the probe.
+/// * `Ok(true)`  – a manager read the selection; copying is unsafe.
+/// * `Err(_)`    – the probe could not run (no Wayland connection or no
+///   wlr-data-control support); the normal clipboard path will surface the
+///   underlying failure.
+pub(crate) fn probe_clipboard_manager() -> anyhow::Result<bool> {
+    let conn = Connection::connect_to_env()?;
+    let (globals, mut event_queue) = registry_queue_init::<ProbeState>(&conn)?;
+    let qh = event_queue.handle();
+
+    let manager: ZwlrDataControlManagerV1 = globals.bind(&qh, 1..=2, ())?;
+    let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=1, ())?;
+    let device = manager.get_data_device(&seat, &qh, ());
+
+    let mut state = ProbeState { consumed: false };
+    event_queue.roundtrip(&mut state)?;
+
+    // Publish a throwaway selection and watch for an unsolicited read.
+    let source = manager.create_data_source(&qh, ());
+    for mime in MIME_TYPES {
+        source.offer(mime.to_string());
+    }
+    device.set_selection(Some(&source));
+    event_queue.flush()?;
+
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(PROBE_TIMEOUT_MS as u64);
+
+    while !state.consumed {
+        event_queue.dispatch_pending(&mut state)?;
+        if state.consumed {
+            break;
+        }
+
+        let remaining =
+            deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        let Some(guard) = event_queue.prepare_read() else {
+            continue;
+        };
+        let conn_fd = guard.connection_fd().as_raw_fd();
+        let mut poll_fds = [libc::pollfd {
+            fd: conn_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let ret = unsafe {
+            libc::poll(poll_fds.as_mut_ptr(), 1, remaining.as_millis() as i32)
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            drop(guard);
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        if ret > 0 && poll_fds[0].revents & libc::POLLIN != 0 {
+            guard.read().ok();
+        } else {
+            drop(guard);
+        }
+    }
+
+    // Clean up: withdraw and destroy the throwaway selection.
+    device.set_selection(None);
+    source.destroy();
+    event_queue.flush().ok();
+
+    Ok(state.consumed)
 }
 
 struct ClipboardState {
@@ -388,6 +499,95 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ClipboardState {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ProbeState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for ProbeState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_seat::WlSeat,
+        _event: wl_seat::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrDataControlManagerV1, ()> for ProbeState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrDataControlManagerV1,
+        _event: <ZwlrDataControlManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrDataControlDeviceV1, ()> for ProbeState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrDataControlDeviceV1,
+        _event: <ZwlrDataControlDeviceV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+
+    wayland_client::event_created_child!(
+        ProbeState,
+        ZwlrDataControlDeviceV1,
+        [zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ZwlrDataControlOfferV1, ())]
+    );
+}
+
+impl Dispatch<ZwlrDataControlOfferV1, ()> for ProbeState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrDataControlOfferV1,
+        _event: <ZwlrDataControlOfferV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrDataControlSourceV1, ()> for ProbeState {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwlrDataControlSourceV1,
+        event: <ZwlrDataControlSourceV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        use wayland_protocols_wlr::data_control::v1::client::zwlr_data_control_source_v1::Event;
+        if let Event::Send { fd, .. } = event {
+            // An external client asked to read our throwaway
+            // selection: a clipboard manager is active.  Satisfy the
+            // read with the throwaway payload and flag detection.
+            let mut file = std::fs::File::from(fd);
+            let _ = file.write_all(PROBE_PAYLOAD);
+            let _ = file.flush();
+            drop(file);
+            state.consumed = true;
         }
     }
 }

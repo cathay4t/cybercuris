@@ -648,6 +648,11 @@ fn cli_get(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 fn cli_clip(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     FORCE_TTY.store(true, Ordering::Relaxed);
     let name = matches.get_one::<String>("NAME").unwrap();
+    // Fail fast (before prompting for the main password) if a clipboard
+    // manager would capture the plaintext and consume the single paste.
+    if clipboard::probe_clipboard_manager()? {
+        anyhow::bail!("{}", clipboard::CLIPBOARD_MANAGER_ERROR);
+    }
     let keystore = Keystore::new()?;
     let ciphertext = keystore.read_password_ciphertext(name)?;
     let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey::new(
@@ -691,13 +696,18 @@ fn cli_restore(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 }
 
 fn run_gui() -> anyhow::Result<()> {
-    let keystore = Rc::new(Keystore::new()?);
+    let keystore = Arc::new(Keystore::new()?);
     let settings = Rc::new(RefCell::new(settings::Settings::load()));
     let cached: Arc<Mutex<CachedKey>> =
         Arc::new(Mutex::new(CachedKey::new(settings.borrow().timeout())));
     let clipboard: Arc<Mutex<Option<clipboard::ClipboardHandle>>> =
         Arc::new(Mutex::new(None));
-    let all_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let all_names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // Detect a clipboard manager up front, before any password is held.
+    // If one is active it would capture the plaintext and consume the
+    // single paste, so we block copying and surface a clear message.
+    let clipboard_blocked =
+        matches!(clipboard::probe_clipboard_manager(), Ok(true));
     // Holds the inactivity timer so it lives for the entire GUI session
     // without being leaked.
     let mut _inactivity_timer: Option<Box<slint::Timer>> = None;
@@ -865,7 +875,7 @@ fn run_gui() -> anyhow::Result<()> {
                     // Lock the current session since data changed.
                     cached.lock().unwrap().drop_key();
                     *clipboard.lock().unwrap() = None;
-                    all_names.borrow_mut().clear();
+                    all_names.lock().unwrap().clear();
                     win.set_locked(true);
                     win.set_status(
                         format!(
@@ -903,7 +913,8 @@ fn run_gui() -> anyhow::Result<()> {
         });
     }
 
-    // Unlock callback
+    // Unlock callback — offload PBKDF2 to a background thread so the
+    // UI stays responsive while the 600k-iteration key derivation runs.
     {
         let keystore = keystore.clone();
         let cached = cached.clone();
@@ -911,46 +922,68 @@ fn run_gui() -> anyhow::Result<()> {
         let all_names = all_names.clone();
         let win_weak = win.as_weak();
         win.on_unlock_password(move |password| {
-            let Some(win) = win_weak.upgrade() else {
-                return;
-            };
-            match keystore.load_main_key(&password) {
-                Ok(guard) => {
-                    let aes_key = keystore::password_aes_key_from_main_key(
-                        guard.as_slice(),
-                    );
-                    match clipboard::spawn_clipboard_thread(aes_key) {
-                        Ok(handle) => {
-                            *clipboard.lock().unwrap() = Some(handle);
-                        }
-                        Err(e) => {
-                            win.set_status(
-                                format!("Clipboard error: {e:#}").into(),
-                            );
-                            return;
-                        }
-                    }
-                    cached.lock().unwrap().set(guard);
-                    win.set_locked(false);
-                    win.set_status("".into());
-                    let names = keystore.list_passwords().unwrap_or_default();
-                    *all_names.borrow_mut() = names.clone();
-                    let shared: Vec<slint::SharedString> = names
-                        .iter()
-                        .map(|n| slint::SharedString::from(n.as_str()))
-                        .collect();
-                    win.set_password_names(slint::ModelRc::new(
-                        slint::VecModel::from(shared),
-                    ));
-                }
-                Err(_) => {
-                    win.set_status("Wrong password.".into());
-                }
+            // Inform the user that work is in progress.
+            if let Some(win) = win_weak.upgrade() {
+                win.set_status("Unlocking...".into());
             }
+            let password = password.to_string();
+            let win_weak = win_weak.clone();
+            let keystore = keystore.clone();
+            let cached = cached.clone();
+            let clipboard = clipboard.clone();
+            let all_names = all_names.clone();
+
+            let _ = thread::spawn(std::panic::AssertUnwindSafe(move || {
+                let result = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| -> anyhow::Result<()> {
+                        let guard = keystore.load_main_key(&password)?;
+                        let aes_key = keystore::password_aes_key_from_main_key(
+                            guard.as_slice(),
+                        );
+                        let handle =
+                            clipboard::spawn_clipboard_thread(aes_key)?;
+                        let names =
+                            keystore.list_passwords().unwrap_or_default();
+                        let _ = win_weak.upgrade_in_event_loop(move |win| {
+                            *clipboard.lock().unwrap() = Some(handle);
+                            cached.lock().unwrap().set(guard);
+                            win.set_locked(false);
+                            win.set_status("".into());
+                            *all_names.lock().unwrap() = names.clone();
+                            let shared: Vec<slint::SharedString> = names
+                                .iter()
+                                .map(|n| slint::SharedString::from(n.as_str()))
+                                .collect();
+                            win.set_password_names(slint::ModelRc::new(
+                                slint::VecModel::from(shared),
+                            ));
+                        });
+                        Ok(())
+                    }),
+                );
+
+                if let Err(e) = result {
+                    let msg = match e.downcast::<String>() {
+                        Ok(s) => *s,
+                        Err(e) => format!("Unlock panic: {e:?}"),
+                    };
+                    let _ = win_weak.upgrade_in_event_loop(move |win| {
+                        win.set_status(format!("Unlock error: {msg}").into());
+                    });
+                    return;
+                }
+
+                if let Err(e) = result.unwrap() {
+                    let _ = win_weak.upgrade_in_event_loop(move |win| {
+                        win.set_status(format!("Wrong password: {e:#}").into());
+                    });
+                }
+            }));
         });
     }
 
-    // Set init password callback
+    // Set init password callback — offload PBKDF2 to a background
+    // thread so the UI stays responsive during key derivation.
     {
         let keystore = keystore.clone();
         let cached = cached.clone();
@@ -968,35 +1001,51 @@ fn run_gui() -> anyhow::Result<()> {
                 win.set_status("Password cannot be empty.".into());
                 return;
             }
-            if let Err(e) = keystore.init_main_key(&p1) {
-                win.set_status(format!("Init error: {e:#}").into());
-                return;
-            }
-            match keystore.load_main_key(&p1) {
-                Ok(guard) => {
-                    let aes_key = keystore::password_aes_key_from_main_key(
-                        guard.as_slice(),
-                    );
-                    match clipboard::spawn_clipboard_thread(aes_key) {
-                        Ok(handle) => {
+            win.set_status("Initializing...".into());
+            let password = p1.to_string();
+            let win_weak = win_weak.clone();
+            let keystore = keystore.clone();
+            let cached = cached.clone();
+            let clipboard = clipboard.clone();
+
+            let _ = thread::spawn(std::panic::AssertUnwindSafe(move || {
+                let result = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| -> anyhow::Result<()> {
+                        keystore.init_main_key(&password)?;
+                        let guard = keystore.load_main_key(&password)?;
+                        let aes_key = keystore::password_aes_key_from_main_key(
+                            guard.as_slice(),
+                        );
+                        let handle =
+                            clipboard::spawn_clipboard_thread(aes_key)?;
+                        let _ = win_weak.upgrade_in_event_loop(move |win| {
                             *clipboard.lock().unwrap() = Some(handle);
-                        }
-                        Err(e) => {
-                            win.set_status(
-                                format!("Clipboard error: {e:#}").into(),
-                            );
-                            return;
-                        }
-                    }
-                    cached.lock().unwrap().set(guard);
-                    win.set_needs_init(false);
-                    win.set_locked(false);
-                    win.set_status("".into());
+                            cached.lock().unwrap().set(guard);
+                            win.set_needs_init(false);
+                            win.set_locked(false);
+                            win.set_status("".into());
+                        });
+                        Ok(())
+                    }),
+                );
+
+                if let Err(e) = result {
+                    let msg = match e.downcast::<String>() {
+                        Ok(s) => *s,
+                        Err(e) => format!("Init panic: {e:?}"),
+                    };
+                    let _ = win_weak.upgrade_in_event_loop(move |win| {
+                        win.set_status(format!("Init error: {msg}").into());
+                    });
+                    return;
                 }
-                Err(e) => {
-                    win.set_status(format!("Load error: {e:#}").into());
+
+                if let Err(e) = result.unwrap() {
+                    let _ = win_weak.upgrade_in_event_loop(move |win| {
+                        win.set_status(format!("Load error: {e:#}").into());
+                    });
                 }
-            }
+            }));
         });
     }
 
@@ -1021,6 +1070,7 @@ fn run_gui() -> anyhow::Result<()> {
         clipboard: clipboard.clone(),
         cached: cached.clone(),
         names: Vec::new(),
+        clipboard_blocked,
     }));
 
     {
@@ -1030,7 +1080,7 @@ fn run_gui() -> anyhow::Result<()> {
             let Some(win) = win_weak.upgrade() else {
                 return;
             };
-            let all = all_names.borrow();
+            let all = all_names.lock().unwrap();
             let filtered: Vec<String> = if text.is_empty() {
                 all.clone()
             } else {
@@ -1064,7 +1114,7 @@ fn run_gui() -> anyhow::Result<()> {
                 name.as_str(),
                 password.as_str(),
             );
-            *all_names.borrow_mut() = app.names.clone();
+            *all_names.lock().unwrap() = app.names.clone();
             stored
         });
     }
@@ -1085,7 +1135,7 @@ fn run_gui() -> anyhow::Result<()> {
                 new_name.as_str(),
                 password.as_str(),
             );
-            *all_names.borrow_mut() = app.names.clone();
+            *all_names.lock().unwrap() = app.names.clone();
         });
     }
 
@@ -1097,8 +1147,11 @@ fn run_gui() -> anyhow::Result<()> {
                 return;
             };
             let mut app = app.borrow_mut();
-            copy_password(&mut app, &win, name.as_str());
-            win.window().hide().ok();
+            // Keep the window visible when copy is blocked so the user
+            // can read the clipboard-manager warning.
+            if copy_password(&mut app, &win, name.as_str()) {
+                win.window().hide().ok();
+            }
         });
     }
 
@@ -1112,7 +1165,7 @@ fn run_gui() -> anyhow::Result<()> {
             };
             let mut app = app.borrow_mut();
             remove_password(&mut app, &win, name.as_str());
-            *all_names.borrow_mut() = app.names.clone();
+            *all_names.lock().unwrap() = app.names.clone();
         });
     }
 
@@ -1126,7 +1179,7 @@ fn run_gui() -> anyhow::Result<()> {
             };
             let mut app = app.borrow_mut();
             refresh(&mut app, &win);
-            *all_names.borrow_mut() = app.names.clone();
+            *all_names.lock().unwrap() = app.names.clone();
         });
     }
 
@@ -1230,6 +1283,9 @@ fn run_gui() -> anyhow::Result<()> {
         }
     }));
 
+    if clipboard_blocked {
+        win.set_status(clipboard::CLIPBOARD_MANAGER_ERROR.into());
+    }
     win.show()?;
     // Signal the listener thread that the event loop is about to run,
     // so it can safely queue callbacks via slint::invoke_from_event_loop.
@@ -1239,19 +1295,25 @@ fn run_gui() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn copy_password(app: &mut App, win: &ui::MainWindow, name: &str) {
+fn copy_password(app: &mut App, win: &ui::MainWindow, name: &str) -> bool {
+    if app.clipboard_blocked {
+        win.set_status(clipboard::CLIPBOARD_MANAGER_ERROR.into());
+        return false;
+    }
     let ciphertext = match app.keystore.read_password_ciphertext(name) {
         Ok(c) => c,
         Err(e) => {
             win.set_status(format!("Read error: {e:#}").into());
-            return;
+            return false;
         }
     };
 
     if let Some(ref clip) = *app.clipboard.lock().unwrap() {
         clip.hold(ciphertext);
         win.set_status(format!("Copied {name} to clipboard.").into());
+        return true;
     }
+    false
 }
 
 fn store_password(
@@ -1370,10 +1432,11 @@ fn refresh(app: &mut App, win: &ui::MainWindow) {
 }
 
 struct App {
-    keystore: Rc<Keystore>,
+    keystore: Arc<Keystore>,
     clipboard: Arc<Mutex<Option<clipboard::ClipboardHandle>>>,
     cached: Arc<Mutex<CachedKey>>,
     names: Vec<String>,
+    clipboard_blocked: bool,
 }
 
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
