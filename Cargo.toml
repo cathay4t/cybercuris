@@ -6,7 +6,7 @@ rust-version = "1.96"
 license = "Apache 2.0"
 
 [dependencies]
-aes-gcm = { path = "/home/fge/Public_Sources/AEADs/aes-gcm" }
+aes-gcm = "0.11"
 anyhow = "1.0.103"
 base64 = "0.22"
 clap = "4.5"
