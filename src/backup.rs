@@ -18,6 +18,8 @@ struct BackupFile {
     main_key_encrypted: String,
     passwords: Vec<PasswordEntry>,
     #[serde(default)]
+    totps: Vec<TotpEntry>,
+    #[serde(default)]
     settings: SettingsData,
 }
 
@@ -25,6 +27,12 @@ struct BackupFile {
 struct PasswordEntry {
     name: String,
     pass_encrypted: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TotpEntry {
+    name: String,
+    totp_encrypted: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -86,10 +94,24 @@ pub(crate) fn backup_to_string(
         });
     }
 
+    let totp_names = keystore.list_totps()?;
+    let mut totps = Vec::with_capacity(totp_names.len());
+    for name in &totp_names {
+        let ciphertext = keystore
+            .read_totp_ciphertext(name)
+            .with_context(|| format!("reading TOTP {name}"))?;
+        let totp_b64 = BASE64_STANDARD.encode(&ciphertext);
+        totps.push(TotpEntry {
+            name: name.clone(),
+            totp_encrypted: totp_b64,
+        });
+    }
+
     let backup = BackupFile {
         version: 1,
         main_key_encrypted: main_key_b64,
         passwords,
+        totps,
         settings: SettingsData::from(settings),
     };
 
@@ -116,12 +138,14 @@ pub(crate) fn restore_from_str(
                  existing data."
             );
         }
-        let existing = keystore.list_passwords()?;
-        if !existing.is_empty() {
+        let existing_passwords = keystore.list_passwords()?;
+        let existing_totps = keystore.list_totps()?;
+        if !existing_passwords.is_empty() || !existing_totps.is_empty() {
             anyhow::bail!(
-                "Password store contains {} existing password(s). Use --force \
-                 to overwrite existing data.",
-                existing.len()
+                "Password store contains {} existing password(s) and {} \
+                 TOTP(s). Use --force to overwrite existing data.",
+                existing_passwords.len(),
+                existing_totps.len()
             );
         }
     }
@@ -166,6 +190,23 @@ pub(crate) fn restore_from_str(
         unsafe { clear_memory(&mut ciphertext) };
     }
 
+    // Write each TOTP file.
+    for entry in &backup.totps {
+        let mut ciphertext =
+            BASE64_STANDARD.decode(&entry.totp_encrypted).with_context(
+                || format!("decoding totp_encrypted for {}", entry.name),
+            )?;
+
+        let path = keystore.totp_path(&entry.name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .context("creating passwords directory")?;
+        }
+        fs::write(&path, &ciphertext)
+            .with_context(|| format!("writing TOTP {}", entry.name))?;
+        unsafe { clear_memory(&mut ciphertext) };
+    }
+
     // Save restored settings.
     let restored_settings = Settings {
         unlock_timeout_secs: backup.settings.unlock_timeout_secs,
@@ -177,8 +218,9 @@ pub(crate) fn restore_from_str(
         .context("saving restored settings")?;
 
     eprintln!(
-        "Restored main key, {} password(s), and settings.",
-        backup.passwords.len()
+        "Restored main key, {} password(s), {} TOTP(s), and settings.",
+        backup.passwords.len(),
+        backup.totps.len()
     );
     Ok(())
 }
@@ -188,7 +230,10 @@ mod tests {
     use std::env;
 
     use super::*;
-    use crate::keystore::Keystore;
+    use crate::{
+        keystore::Keystore,
+        totp::{TotpAlgorithm, TotpParams},
+    };
 
     #[test]
     fn test_backup_restore_roundtrip() {
@@ -206,6 +251,19 @@ mod tests {
         src_keystore
             .store_password("github", b"gh_p4ss!", main_key.as_slice())
             .unwrap();
+        let totp_params = TotpParams {
+            algorithm: TotpAlgorithm::Sha256,
+            digits: 6,
+            period: 30,
+        };
+        src_keystore
+            .store_totp(
+                "github-totp",
+                b"JBSWY3DPEHPK3PXP",
+                &totp_params,
+                main_key.as_slice(),
+            )
+            .unwrap();
         drop(main_key);
 
         let settings = Settings::default();
@@ -215,6 +273,8 @@ mod tests {
         assert!(yaml.contains("main_key_encrypted:"));
         assert!(yaml.contains("example.com"));
         assert!(yaml.contains("github"));
+        assert!(yaml.contains("github-totp"));
+        assert!(yaml.contains("totps:"));
         assert!(yaml.contains("unlock_timeout_secs"));
         assert!(yaml.contains("quit_key"));
         assert!(yaml.contains("hide_key"));
@@ -246,6 +306,18 @@ mod tests {
         .unwrap();
         assert_eq!(pw2.as_slice(), b"gh_p4ss!");
         drop(pw2);
+
+        let totp_ct = dst_keystore.read_totp_ciphertext("github-totp").unwrap();
+        let totp_plain = crate::keystore::decrypt_with_main_key(
+            main_key.as_slice(),
+            &totp_ct,
+        )
+        .unwrap();
+        let (decoded_params, secret) =
+            crate::totp::decode_entry(totp_plain.as_slice()).unwrap();
+        assert_eq!(decoded_params, totp_params);
+        assert_eq!(secret, b"JBSWY3DPEHPK3PXP");
+        drop(totp_plain);
         drop(main_key);
 
         // Verify listing.
@@ -253,6 +325,8 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"example.com".to_string()));
         assert!(names.contains(&"github".to_string()));
+        let totp_names = dst_keystore.list_totps().unwrap();
+        assert_eq!(totp_names, vec!["github-totp".to_string()]);
 
         // Verify settings were restored.
         let restored = Settings::load();

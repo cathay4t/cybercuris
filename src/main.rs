@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context as _;
@@ -19,6 +19,7 @@ use slint::ComponentHandle;
 use crate::{
     keystore::Keystore,
     memory_guard::{MemoryGuard, PasswordBuf, clear_memory},
+    totp::TotpParams,
 };
 
 /// Zero a String's heap-allocated buffer before it is dropped, preventing
@@ -435,6 +436,13 @@ fn aes_password_key(cached: &Arc<Mutex<CachedKey>>) -> Option<[u8; 32]> {
     c.as_slice().map(keystore::password_aes_key_from_main_key)
 }
 
+fn unix_time() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before Unix epoch")?
+        .as_secs())
+}
+
 fn with_main_key<F, T>(cached: &Arc<Mutex<CachedKey>>, f: F) -> Option<T>
 where
     F: FnOnce(&[u8]) -> T,
@@ -484,6 +492,43 @@ fn main() -> anyhow::Result<()> {
             ),
         )
         .subcommand(
+            Command::new("store-totp")
+                .about("Store a TOTP secret")
+                .arg(Arg::new("NAME").required(true).index(1).help("TOTP name"))
+                .arg(
+                    Arg::new("algorithm")
+                        .short('a')
+                        .long("algorithm")
+                        .value_parser(["sha1", "sha256", "sha512"])
+                        .default_value("sha1")
+                        .help("HMAC hash algorithm (sha1, sha256, sha512)"),
+                )
+                .arg(
+                    Arg::new("digits")
+                        .short('d')
+                        .long("digits")
+                        .value_parser(clap::value_parser!(u8).range(6..=8))
+                        .default_value("6")
+                        .help("Number of OTP digits (6-8)"),
+                )
+                .arg(
+                    Arg::new("period")
+                        .short('p')
+                        .long("period")
+                        .value_parser(clap::value_parser!(u32).range(1..=3600))
+                        .default_value("30")
+                        .help("Time step in seconds"),
+                )
+                .arg(
+                    Arg::new("raw")
+                        .long("raw")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Treat the secret as raw bytes instead of base32",
+                        ),
+                ),
+        )
+        .subcommand(
             Command::new("get")
                 .about("Retrieve and print a password to stdout")
                 .arg(
@@ -495,22 +540,29 @@ fn main() -> anyhow::Result<()> {
         )
         .subcommand(
             Command::new("clip")
-                .about("Copy a password to the Wayland clipboard")
+                .about(
+                    "Copy a password, or generate and copy a TOTP, to the \
+                     Wayland clipboard",
+                )
                 .arg(
                     Arg::new("NAME")
                         .required(true)
                         .index(1)
-                        .help("Password name"),
+                        .help("Password or TOTP name"),
                 ),
         )
-        .subcommand(Command::new("list").about("List stored password names"))
+        .subcommand(
+            Command::new("list").about("List stored password and TOTP names"),
+        )
         .subcommand(Command::new("backup").about(
-            "Export all passwords as an encrypted YAML backup to stdout",
+            "Export all passwords and TOTPs as an encrypted YAML backup to \
+             stdout",
         ))
         .subcommand(
             Command::new("restore")
                 .about(
-                    "Restore passwords from an encrypted YAML backup on stdin",
+                    "Restore passwords and TOTPs from an encrypted YAML \
+                     backup on stdin",
                 )
                 .arg(
                     Arg::new("force")
@@ -547,6 +599,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(("init", sub_m)) => cli_init(sub_m),
         Some(("store", sub_m)) => cli_store(sub_m),
+        Some(("store-totp", sub_m)) => cli_store_totp(sub_m),
         Some(("get", sub_m)) => cli_get(sub_m),
         Some(("clip", sub_m)) => cli_clip(sub_m),
         Some(("list", _)) => cli_list(),
@@ -619,6 +672,53 @@ fn cli_store(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     }
 }
 
+fn cli_store_totp(matches: &clap::ArgMatches) -> anyhow::Result<()> {
+    FORCE_TTY.store(true, Ordering::Relaxed);
+    let name = matches.get_one::<String>("NAME").unwrap();
+    let algorithm = matches
+        .get_one::<String>("algorithm")
+        .unwrap()
+        .parse::<totp::TotpAlgorithm>()?;
+    let digits = *matches.get_one::<u8>("digits").unwrap();
+    let period = *matches.get_one::<u32>("period").unwrap();
+    let raw = matches.get_flag("raw");
+    let params = TotpParams {
+        algorithm,
+        digits,
+        period,
+    };
+    params.validate()?;
+
+    let keystore = Keystore::new()?;
+    let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey::new(
+        settings::Settings::load().timeout(),
+    )));
+
+    unlock_key_with_init(&keystore, &cached)?;
+
+    let secret_buf = read_password_tty("Enter TOTP secret")?;
+    let mut secret = totp::decode_secret(&secret_buf, raw)?;
+    drop(secret_buf);
+
+    let stored = with_main_key(&cached, |mk| {
+        keystore.store_totp(name, &secret, &params, mk)
+    });
+    unsafe { clear_memory(&mut secret) };
+
+    match stored {
+        Some(Ok(())) => {
+            println!("Stored TOTP for {name}.");
+            Ok(())
+        }
+        Some(Err(e)) => {
+            anyhow::bail!("Failed to store TOTP for {name}: {e:#}")
+        }
+        None => {
+            anyhow::bail!("Key expired — please unlock again")
+        }
+    }
+}
+
 fn cli_get(matches: &clap::ArgMatches) -> anyhow::Result<()> {
     FORCE_TTY.store(true, Ordering::Relaxed);
     let name = matches.get_one::<String>("NAME").unwrap();
@@ -654,7 +754,6 @@ fn cli_clip(matches: &clap::ArgMatches) -> anyhow::Result<()> {
         anyhow::bail!("{}", clipboard::CLIPBOARD_MANAGER_ERROR);
     }
     let keystore = Keystore::new()?;
-    let ciphertext = keystore.read_password_ciphertext(name)?;
     let cached: Arc<Mutex<CachedKey>> = Arc::new(Mutex::new(CachedKey::new(
         settings::Settings::load().timeout(),
     )));
@@ -663,6 +762,29 @@ fn cli_clip(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
     let aes_key = aes_password_key(&cached)
         .ok_or_else(|| anyhow::anyhow!("Failed to get AES key"))?;
+
+    if keystore.has_totp(name) {
+        let ciphertext = keystore.read_totp_ciphertext(name)?;
+        let plain = with_main_key(&cached, |mk| {
+            keystore::decrypt_with_main_key(mk, &ciphertext)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("Key expired — please unlock again")
+        })??;
+        let (params, secret) = totp::decode_entry(plain.as_slice())?;
+        let mut code = totp::generate_totp(secret, &params, unix_time()?)?;
+        let otp_ciphertext =
+            keystore::encrypt_with_aes_key(&aes_key, code.as_bytes())?;
+        zero_string(&mut code);
+        drop(plain);
+
+        let clipboard = clipboard::spawn_clipboard_thread(aes_key)?;
+        clipboard.hold_and_wait(otp_ciphertext);
+        println!("Copied {name} TOTP to clipboard.");
+        return Ok(());
+    }
+
+    let ciphertext = keystore.read_password_ciphertext(name)?;
     let clipboard = clipboard::spawn_clipboard_thread(aes_key)?;
     clipboard.hold_and_wait(ciphertext);
     println!("Copied {name} to clipboard.");
@@ -671,11 +793,15 @@ fn cli_clip(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
 fn cli_list() -> anyhow::Result<()> {
     let keystore = Keystore::new()?;
-    let names = keystore.list_passwords()?;
-    for name in &names {
+    let passwords = keystore.list_passwords()?;
+    let totps = keystore.list_totps()?;
+    for name in &passwords {
         println!("{name}");
     }
-    if names.is_empty() {
+    for name in &totps {
+        println!("{name} (TOTP)");
+    }
+    if passwords.is_empty() && totps.is_empty() {
         println!("(no passwords stored)");
     }
     Ok(())
@@ -1461,4 +1587,5 @@ mod keystore;
 mod memory_guard;
 mod settings;
 mod single_instance;
+mod totp;
 mod ui;

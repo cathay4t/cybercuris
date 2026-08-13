@@ -12,7 +12,10 @@ use sha2::Sha256;
 
 type AesNonce = Nonce<<Aes256Gcm as AeadCore>::NonceSize>;
 
-use crate::memory_guard::{MemoryGuard, clear_memory};
+use crate::{
+    memory_guard::{MemoryGuard, clear_memory},
+    totp::{self, TotpParams},
+};
 
 /// Old PBKDF2 parameters (pre-migration).
 const PBKDF2_ITERATIONS_OLD: u32 = 100_000;
@@ -157,13 +160,7 @@ impl Keystore {
         main_key: &[u8],
     ) -> anyhow::Result<()> {
         let aes_key = derive_key_from_main_key(main_key);
-        let cipher = Aes256Gcm::new(&aes_key);
-        let mut nonce_bytes = [0u8; 12];
-        rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce: AesNonce = Nonce::from(nonce_bytes);
-        let ciphertext = cipher
-            .encrypt(&nonce, password)
-            .context("encrypting password")?;
+        let (nonce, ciphertext) = encrypt_with_key(&aes_key, password)?;
 
         let path = self.password_path(name);
         // If a legacy file exists under the same (or a colliding) name,
@@ -174,6 +171,24 @@ impl Keystore {
             let _ = fs::remove_file(&legacy);
         }
         write_with_nonce(&nonce, &ciphertext, &path)
+    }
+
+    pub(crate) fn store_totp(
+        &self,
+        name: &str,
+        secret: &[u8],
+        params: &TotpParams,
+        main_key: &[u8],
+    ) -> anyhow::Result<()> {
+        let aes_key = derive_key_from_main_key(main_key);
+        let mut plain = totp::encode_entry(params, secret)?;
+        let result = (|| {
+            let (nonce, ciphertext) = encrypt_with_key(&aes_key, &plain)?;
+            let path = self.totp_path(name);
+            write_with_nonce(&nonce, &ciphertext, &path)
+        })();
+        unsafe { clear_memory(&mut plain) };
+        result
     }
 
     pub(crate) fn read_password_ciphertext(
@@ -189,6 +204,21 @@ impl Keystore {
 
     pub(crate) fn has_password(&self, name: &str) -> bool {
         self.resolve_password_path(name).is_some()
+    }
+
+    pub(crate) fn read_totp_ciphertext(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let path = self
+            .resolve_totp_path(name)
+            .ok_or_else(|| anyhow::anyhow!("TOTP not found: {name}"))?;
+        fs::read(&path)
+            .with_context(|| format!("reading encrypted TOTP for {name}"))
+    }
+
+    pub(crate) fn has_totp(&self, name: &str) -> bool {
+        self.resolve_totp_path(name).is_some()
     }
 
     pub(crate) fn remove_password(&self, name: &str) -> anyhow::Result<()> {
@@ -262,11 +292,42 @@ impl Keystore {
         Ok(names)
     }
 
+    pub(crate) fn list_totps(&self) -> anyhow::Result<Vec<String>> {
+        let dir = self.data_dir.join("passwords");
+        let mut seen = std::collections::HashSet::new();
+        let mut names = vec![];
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(names);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "totp")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && seen.insert(stem.to_string())
+            {
+                names.push(stem.to_string());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     /// Primary (collision-free) filename for `name`.
     pub(crate) fn password_path(&self, name: &str) -> PathBuf {
         self.data_dir
             .join("passwords")
             .join(format!("{}.key", sanitize_filename(name)))
+    }
+
+    pub(crate) fn totp_path(&self, name: &str) -> PathBuf {
+        self.data_dir
+            .join("passwords")
+            .join(format!("{}.totp", sanitize_filename(name)))
     }
 
     /// Legacy filename (old `_`-only encoding) for `name`, if it
@@ -299,6 +360,11 @@ impl Keystore {
         }
         None
     }
+
+    fn resolve_totp_path(&self, name: &str) -> Option<PathBuf> {
+        let path = self.totp_path(name);
+        path.exists().then_some(path)
+    }
 }
 
 pub(crate) fn decrypt_with_main_key(
@@ -328,6 +394,31 @@ pub(crate) fn decrypt_with_aes_key_into_writer(
     writer.write_all(&plain)?;
     unsafe { clear_memory(&mut plain) };
     Ok(())
+}
+
+pub(crate) fn encrypt_with_aes_key(
+    raw_key: &[u8; 32],
+    plain: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let aes_key: Key<Aes256Gcm> = (*raw_key).into();
+    let (nonce, ciphertext) = encrypt_with_key(&aes_key, plain)?;
+    let mut data = Vec::with_capacity(12 + ciphertext.len());
+    data.extend_from_slice(nonce.as_slice());
+    data.extend_from_slice(&ciphertext);
+    Ok(data)
+}
+
+fn encrypt_with_key(
+    aes_key: &Key<Aes256Gcm>,
+    plain: &[u8],
+) -> anyhow::Result<(AesNonce, Vec<u8>)> {
+    let cipher = Aes256Gcm::new(aes_key);
+    let mut nonce_bytes = [0u8; 12];
+    rand::rng().fill_bytes(&mut nonce_bytes);
+    let nonce: AesNonce = Nonce::from(nonce_bytes);
+    let ciphertext =
+        cipher.encrypt(&nonce, plain).context("encrypting data")?;
+    Ok((nonce, ciphertext))
 }
 
 fn decrypt_with_main_key_into_vec(

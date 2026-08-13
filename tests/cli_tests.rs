@@ -88,6 +88,7 @@ fn test_cli_help() {
     assert!(out.contains("cybercuris"));
     assert!(out.contains("init"));
     assert!(out.contains("store"));
+    assert!(out.contains("store-totp"));
     assert!(out.contains("get"));
     assert!(out.contains("clip"));
     assert!(out.contains("list"));
@@ -150,6 +151,111 @@ fn test_cli_init_store_get_list() {
     assert!(ok);
     assert!(out.contains("my-website.com"));
 
+    let _ = fs::remove_dir_all(data_home(home));
+}
+
+#[test]
+fn test_cli_store_totp_list() {
+    let home = "cybercuris_test_totp";
+    let _ = fs::remove_dir_all(data_home(home));
+
+    let (_, _, ok) =
+        run_stdin(home, &["-t", "init"], MAIN_PASS_INIT.as_bytes());
+    assert!(ok, "init failed");
+
+    // Base32 secret, default SHA-1 / 6 digits / 30 s.
+    let input = format!("{MAIN_PASS}JBSWY3DPEHPK3PXP\n");
+    let (out, _, ok) =
+        run_stdin(home, &["-t", "store-totp", "otp1"], input.as_bytes());
+    assert!(ok, "store-totp failed: {out}");
+    assert!(out.contains("Stored TOTP for otp1"), "stdout={out}");
+
+    // Raw RFC 6238 secret with SHA-512 and 8 digits.
+    let input = format!(
+        "{MAIN_PASS}\
+         1234567890123456789012345678901234567890123456789012345678901234\n"
+    );
+    let (out, _, ok) = run_stdin(
+        home,
+        &[
+            "-t",
+            "store-totp",
+            "otp2",
+            "-a",
+            "sha512",
+            "-d",
+            "8",
+            "--raw",
+        ],
+        input.as_bytes(),
+    );
+    assert!(ok, "store-totp sha512 failed: {out}");
+    assert!(out.contains("Stored TOTP for otp2"), "stdout={out}");
+
+    let (out, _, ok) = run(home, &["-t", "list"]);
+    assert!(ok, "list failed: {out}");
+    assert!(out.contains("otp1 (TOTP)"), "list={out}");
+    assert!(out.contains("otp2 (TOTP)"), "list={out}");
+
+    let _ = fs::remove_dir_all(data_home(home));
+}
+
+#[test]
+fn test_cli_clip_totp() {
+    let _lock = CLIPBOARD_MUTEX.lock().unwrap();
+    if !wl_paste_available() {
+        eprintln!("SKIP: wl-paste not available");
+        return;
+    }
+
+    let home = "cybercuris_test_clip_totp";
+    let _ = fs::remove_dir_all(data_home(home));
+
+    let _ = wl_paste();
+
+    let (_, _, ok) =
+        run_stdin(home, &["-t", "init"], MAIN_PASS_INIT.as_bytes());
+    assert!(ok);
+
+    let input = format!("{MAIN_PASS}JBSWY3DPEHPK3PXP\n");
+    let (_, _, ok) =
+        run_stdin(home, &["-t", "store-totp", "clip_otp"], input.as_bytes());
+    assert!(ok);
+
+    let mut clip = cmd_with_home(home);
+    clip.args(["-t", "clip", "clip_otp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = clip.spawn().expect("spawn clip");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(MAIN_PASS.as_bytes())
+        .unwrap();
+
+    std::thread::sleep(Duration::from_millis(2000));
+
+    let mut pasted = String::new();
+    for _ in 0..10 {
+        pasted = wl_paste().trim().to_string();
+        if pasted.len() == 6 && pasted.chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let output = child.wait_with_output().unwrap();
+    drop(output);
+
+    assert_eq!(pasted.len(), 6, "TOTP should be 6 digits, got '{pasted}'");
+    assert!(
+        pasted.chars().all(|c| c.is_ascii_digit()),
+        "TOTP must be numeric, got '{pasted}'"
+    );
+
+    let _ = Command::new("wl-copy").arg("--clear").output();
     let _ = fs::remove_dir_all(data_home(home));
 }
 
