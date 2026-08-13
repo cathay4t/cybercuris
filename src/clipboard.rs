@@ -230,6 +230,11 @@ struct ClipboardState {
     held: Option<Vec<u8>>,
     aes_key: [u8; 32],
     done_tx: Option<mpsc::Sender<()>>,
+    /// Paste-once: set to true once the current selection has been
+    /// delivered to a reader.  Any Send that races the destruction pass
+    /// afterwards gets an empty read instead of another copy of the
+    /// secret.  Reset when a new selection is published.
+    consumed: bool,
     /// Paste-once: set to true on the first Send event.
     /// On the *next* iteration we destroy the source so
     /// the compositor has processed our fd write first.
@@ -258,6 +263,7 @@ fn run_clipboard_loop(
         held: None,
         aes_key,
         done_tx: None,
+        consumed: false,
         pending_destroy: false,
     };
 
@@ -391,6 +397,7 @@ fn set_selection(
     state.held = Some(ciphertext);
     state.done_tx = done;
     state.pending_destroy = false;
+    state.consumed = false;
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ClipboardState {
@@ -474,6 +481,12 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ClipboardState {
                 if !mime_type.starts_with("text/plain") {
                     return;
                 }
+                if state.consumed {
+                    // A second reader raced the destruction pass.  Close
+                    // the fd without writing so it reads empty data.
+                    drop(std::fs::File::from(fd));
+                    return;
+                }
                 if let Some(ciphertext) = state.held.as_ref() {
                     let mut file = std::fs::File::from(fd);
                     let _ = keystore::decrypt_with_aes_key_into_writer(
@@ -483,6 +496,7 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ClipboardState {
                     );
                     let _ = file.flush();
                     drop(file);
+                    state.consumed = true;
                     // Paste-once: flag the source for destruction
                     // on the next event-loop iteration so the
                     // compositor processes our fd write first.
