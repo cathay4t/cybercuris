@@ -213,6 +213,123 @@ pub fn decode_secret(input: &str, force_raw: bool) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+pub struct TotpUri {
+    pub secret: Vec<u8>,
+    pub params: TotpParams,
+}
+
+/// Resolve a CLI/GUI-provided secret into key bytes and parameters.
+///
+/// If the input is an `otpauth://` provisioning URI, the secret and the
+/// algorithm/digits/period are taken from the URI.  Otherwise the secret is
+/// decoded with [`decode_secret`] and `fallback` parameters are used, since
+/// a bare secret does not encode the algorithm.
+pub fn resolve_secret(
+    input: &str,
+    fallback: TotpParams,
+    force_raw: bool,
+) -> anyhow::Result<(Vec<u8>, TotpParams)> {
+    let trimmed = input.trim();
+    if is_otpauth_uri(trimmed) {
+        let uri = parse_otpauth_uri(trimmed)?;
+        Ok((uri.secret, uri.params))
+    } else {
+        Ok((decode_secret(input, force_raw)?, fallback))
+    }
+}
+
+pub fn is_otpauth_uri(input: &str) -> bool {
+    input.trim().to_ascii_lowercase().starts_with("otpauth://")
+}
+
+/// Parse an `otpauth://` TOTP provisioning URI (Key URI Format).
+///
+/// Example:
+/// `otpauth://totp/Example:alice@example.com?secret=JBSWY3DPEHPK3PXP&
+/// issuer=Example&algorithm=SHA256&digits=8&period=30`
+pub fn parse_otpauth_uri(input: &str) -> anyhow::Result<TotpUri> {
+    let trimmed = input.trim();
+    let rest = trimmed
+        .strip_prefix("otpauth://")
+        .or_else(|| trimmed.strip_prefix("OTPAUTH://"))
+        .ok_or_else(|| anyhow!("not an otpauth URI"))?;
+    let (path, query) = rest
+        .split_once('?')
+        .ok_or_else(|| anyhow!("otpauth URI missing query string"))?;
+    let otp_type = path.split('/').next().unwrap_or("");
+    if otp_type != "totp" {
+        bail!("only TOTP otpauth URIs are supported, got {otp_type}");
+    }
+
+    let mut secret = None;
+    let mut algorithm = TotpAlgorithm::Sha1;
+    let mut digits: u8 = 6;
+    let mut period: u32 = 30;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let value = percent_decode(value);
+        match key.to_ascii_lowercase().as_str() {
+            "secret" => secret = Some(value),
+            "algorithm" => algorithm = value.parse::<TotpAlgorithm>()?,
+            "digits" => {
+                digits =
+                    value.parse().context("invalid digits in otpauth URI")?
+            }
+            "period" => {
+                period =
+                    value.parse().context("invalid period in otpauth URI")?
+            }
+            _ => {}
+        }
+    }
+
+    let secret = secret
+        .ok_or_else(|| anyhow!("otpauth URI missing secret parameter"))?;
+    let secret_bytes = decode_base32(&secret)
+        .context("invalid base32 secret in otpauth URI")?;
+    let params = TotpParams {
+        algorithm,
+        digits,
+        period,
+    };
+    params.validate()?;
+    Ok(TotpUri {
+        secret: secret_bytes,
+        params,
+    })
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) =
+                (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn looks_like_base32(input: &str) -> bool {
     let mut has_data = false;
     input.chars().all(|c| {
@@ -425,5 +542,85 @@ mod tests {
         let (decoded, secret) = decode_entry(&encoded).unwrap();
         assert_eq!(decoded, params);
         assert_eq!(secret, b"secret");
+    }
+
+    #[test]
+    fn test_parse_otpauth_uri() {
+        let uri = parse_otpauth_uri(
+            "otpauth://totp/Example:alice@example.com?secret=JBSWY3DPEE&\
+             issuer=Example",
+        )
+        .unwrap();
+        assert_eq!(uri.secret, b"Hello!");
+        assert_eq!(uri.params.algorithm, TotpAlgorithm::Sha1);
+        assert_eq!(uri.params.digits, 6);
+        assert_eq!(uri.params.period, 30);
+
+        let uri = parse_otpauth_uri(
+            "otpauth://totp/Label?secret=JBSWY3DPEE&algorithm=SHA256&digits=8&\
+             period=60",
+        )
+        .unwrap();
+        assert_eq!(uri.params.algorithm, TotpAlgorithm::Sha256);
+        assert_eq!(uri.params.digits, 8);
+        assert_eq!(uri.params.period, 60);
+
+        // Percent-encoded base32 padding decodes before base32 decoding.
+        let uri = parse_otpauth_uri(
+            "otpauth://totp/Label?secret=JBSWY3DPEE%3D%3D%3D%3D%3D%3D&\
+             algorithm=SHA512",
+        )
+        .unwrap();
+        assert_eq!(uri.secret, b"Hello!");
+        assert_eq!(uri.params.algorithm, TotpAlgorithm::Sha512);
+    }
+
+    #[test]
+    fn test_parse_otpauth_uri_errors() {
+        assert!(
+            parse_otpauth_uri("otpauth://hotp/Label?secret=JBSWY3DPEE")
+                .is_err()
+        );
+        assert!(
+            parse_otpauth_uri("otpauth://totp/Label?algorithm=SHA256").is_err()
+        );
+        assert!(
+            parse_otpauth_uri(
+                "otpauth://totp/Label?secret=JBSWY3DPEE&digits=9"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_otpauth_uri(
+                "otpauth://totp/Label?secret=JBSWY3DPEE&period=0"
+            )
+            .is_err()
+        );
+        assert!(parse_otpauth_uri("not a uri").is_err());
+    }
+
+    #[test]
+    fn test_resolve_secret_uri_and_bare() {
+        let fallback = TotpParams {
+            algorithm: TotpAlgorithm::Sha256,
+            digits: 7,
+            period: 45,
+        };
+
+        let (secret, params) = resolve_secret(
+            "otpauth://totp/Label?secret=JBSWY3DPEE&algorithm=SHA512&digits=8",
+            fallback,
+            false,
+        )
+        .unwrap();
+        assert_eq!(secret, b"Hello!");
+        assert_eq!(params.algorithm, TotpAlgorithm::Sha512);
+        assert_eq!(params.digits, 8);
+        assert_eq!(params.period, 30);
+
+        let (secret, params) =
+            resolve_secret("12345678901234567890", fallback, false).unwrap();
+        assert_eq!(secret, b"12345678901234567890");
+        assert_eq!(params, fallback);
     }
 }

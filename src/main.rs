@@ -19,7 +19,7 @@ use slint::ComponentHandle;
 use crate::{
     keystore::Keystore,
     memory_guard::{MemoryGuard, PasswordBuf, clear_memory},
-    totp::TotpParams,
+    totp::{TotpAlgorithm, TotpParams},
 };
 
 /// Zero a String's heap-allocated buffer before it is dropped, preventing
@@ -696,8 +696,9 @@ fn cli_store_totp(matches: &clap::ArgMatches) -> anyhow::Result<()> {
 
     unlock_key_with_init(&keystore, &cached)?;
 
-    let secret_buf = read_password_tty("Enter TOTP secret")?;
-    let mut secret = totp::decode_secret(&secret_buf, raw)?;
+    let secret_buf =
+        read_password_tty("Enter TOTP secret (base32 or otpauth:// URI)")?;
+    let (mut secret, params) = totp::resolve_secret(&secret_buf, params, raw)?;
     drop(secret_buf);
 
     let stored = with_main_key(&cached, |mk| {
@@ -828,7 +829,8 @@ fn run_gui() -> anyhow::Result<()> {
         Arc::new(Mutex::new(CachedKey::new(settings.borrow().timeout())));
     let clipboard: Arc<Mutex<Option<clipboard::ClipboardHandle>>> =
         Arc::new(Mutex::new(None));
-    let all_names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let all_entries: Arc<Mutex<Vec<ui::EntryInfo>>> =
+        Arc::new(Mutex::new(Vec::new()));
     // Detect a clipboard manager up front, before any password is held.
     // If one is active it would capture the plaintext and consume the
     // single paste, so we block copying and surface a clear message.
@@ -963,7 +965,7 @@ fn run_gui() -> anyhow::Result<()> {
         let settings = settings.clone();
         let cached = cached.clone();
         let clipboard = clipboard.clone();
-        let all_names = all_names.clone();
+        let all_entries = all_entries.clone();
         let win_weak = win.as_weak();
         win.on_restore_pressed(move || {
             let Some(win) = win_weak.upgrade() else {
@@ -1001,7 +1003,7 @@ fn run_gui() -> anyhow::Result<()> {
                     // Lock the current session since data changed.
                     cached.lock().unwrap().drop_key();
                     *clipboard.lock().unwrap() = None;
-                    all_names.lock().unwrap().clear();
+                    all_entries.lock().unwrap().clear();
                     win.set_locked(true);
                     win.set_status(
                         format!(
@@ -1045,7 +1047,7 @@ fn run_gui() -> anyhow::Result<()> {
         let keystore = keystore.clone();
         let cached = cached.clone();
         let clipboard = clipboard.clone();
-        let all_names = all_names.clone();
+        let all_entries = all_entries.clone();
         let win_weak = win.as_weak();
         win.on_unlock_password(move |password| {
             // Inform the user that work is in progress.
@@ -1057,7 +1059,7 @@ fn run_gui() -> anyhow::Result<()> {
             let keystore = keystore.clone();
             let cached = cached.clone();
             let clipboard = clipboard.clone();
-            let all_names = all_names.clone();
+            let all_entries = all_entries.clone();
 
             let _ = thread::spawn(std::panic::AssertUnwindSafe(move || {
                 let result = std::panic::catch_unwind(
@@ -1068,20 +1070,16 @@ fn run_gui() -> anyhow::Result<()> {
                         );
                         let handle =
                             clipboard::spawn_clipboard_thread(aes_key)?;
-                        let names =
-                            keystore.list_passwords().unwrap_or_default();
+                        let entries =
+                            list_entries(&keystore).unwrap_or_default();
                         let _ = win_weak.upgrade_in_event_loop(move |win| {
                             *clipboard.lock().unwrap() = Some(handle);
                             cached.lock().unwrap().set(guard);
                             win.set_locked(false);
                             win.set_status("".into());
-                            *all_names.lock().unwrap() = names.clone();
-                            let shared: Vec<slint::SharedString> = names
-                                .iter()
-                                .map(|n| slint::SharedString::from(n.as_str()))
-                                .collect();
-                            win.set_password_names(slint::ModelRc::new(
-                                slint::VecModel::from(shared),
+                            *all_entries.lock().unwrap() = entries.clone();
+                            win.set_entries(slint::ModelRc::new(
+                                slint::VecModel::from(entries),
                             ));
                         });
                         Ok(())
@@ -1195,32 +1193,30 @@ fn run_gui() -> anyhow::Result<()> {
         keystore: keystore.clone(),
         clipboard: clipboard.clone(),
         cached: cached.clone(),
-        names: Vec::new(),
+        entries: Vec::new(),
         clipboard_blocked,
     }));
 
     {
-        let all_names = all_names.clone();
+        let all_entries = all_entries.clone();
         let win_weak = win.as_weak();
         win.on_filter_changed(move |text| {
             let Some(win) = win_weak.upgrade() else {
                 return;
             };
-            let all = all_names.lock().unwrap();
-            let filtered: Vec<String> = if text.is_empty() {
+            let all = all_entries.lock().unwrap();
+            let filtered: Vec<ui::EntryInfo> = if text.is_empty() {
                 all.clone()
             } else {
                 all.iter()
-                    .filter(|n| n.to_lowercase().contains(&text.to_lowercase()))
+                    .filter(|e| {
+                        e.name.to_lowercase().contains(&text.to_lowercase())
+                    })
                     .cloned()
                     .collect()
             };
-            let shared: Vec<slint::SharedString> = filtered
-                .iter()
-                .map(|n| slint::SharedString::from(n.as_str()))
-                .collect();
-            win.set_password_names(slint::ModelRc::new(slint::VecModel::from(
-                shared,
+            win.set_entries(slint::ModelRc::new(slint::VecModel::from(
+                filtered,
             )));
         });
     }
@@ -1228,7 +1224,7 @@ fn run_gui() -> anyhow::Result<()> {
     {
         let app = app.clone();
         let win_weak = win.as_weak();
-        let all_names = all_names.clone();
+        let all_entries = all_entries.clone();
         win.on_store_password(move |name, password| {
             let Some(win) = win_weak.upgrade() else {
                 return false;
@@ -1240,7 +1236,7 @@ fn run_gui() -> anyhow::Result<()> {
                 name.as_str(),
                 password.as_str(),
             );
-            *all_names.lock().unwrap() = app.names.clone();
+            *all_entries.lock().unwrap() = app.entries.clone();
             stored
         });
     }
@@ -1248,7 +1244,55 @@ fn run_gui() -> anyhow::Result<()> {
     {
         let app = app.clone();
         let win_weak = win.as_weak();
-        let all_names = all_names.clone();
+        let all_entries = all_entries.clone();
+        win.on_store_totp(move |name, secret, algorithm, digits, period| {
+            let Some(win) = win_weak.upgrade() else {
+                return false;
+            };
+            let mut app = app.borrow_mut();
+            let stored = store_totp(
+                &mut app,
+                &win,
+                name.as_str(),
+                secret.as_str(),
+                algorithm.as_str(),
+                digits.as_str(),
+                period.as_str(),
+            );
+            *all_entries.lock().unwrap() = app.entries.clone();
+            stored
+        });
+    }
+
+    {
+        let win_weak = win.as_weak();
+        win.on_totp_secret_changed(move |secret| {
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
+            match totp::parse_otpauth_uri(secret.as_str()) {
+                Ok(uri) => {
+                    let index = match uri.params.algorithm {
+                        TotpAlgorithm::Sha1 => 0,
+                        TotpAlgorithm::Sha256 => 1,
+                        TotpAlgorithm::Sha512 => 2,
+                    };
+                    win.set_add_algorithm_index(index);
+                    win.set_add_digits(uri.params.digits.to_string().into());
+                    win.set_add_period(uri.params.period.to_string().into());
+                    win.set_add_uri_detected(true);
+                }
+                Err(_) => {
+                    win.set_add_uri_detected(false);
+                }
+            }
+        });
+    }
+
+    {
+        let app = app.clone();
+        let win_weak = win.as_weak();
+        let all_entries = all_entries.clone();
         win.on_edit_password(move |old_name, new_name, password| {
             let Some(win) = win_weak.upgrade() else {
                 return;
@@ -1261,8 +1305,54 @@ fn run_gui() -> anyhow::Result<()> {
                 new_name.as_str(),
                 password.as_str(),
             );
-            *all_names.lock().unwrap() = app.names.clone();
+            *all_entries.lock().unwrap() = app.entries.clone();
         });
+    }
+
+    {
+        let app = app.clone();
+        let win_weak = win.as_weak();
+        let all_entries = all_entries.clone();
+        win.on_edit_totp(
+            move |old_name, new_name, secret, algorithm, digits, period| {
+                let Some(win) = win_weak.upgrade() else {
+                    return;
+                };
+                let params = if secret.is_empty() {
+                    None
+                } else if totp::is_otpauth_uri(secret.as_str()) {
+                    // The otpauth URI carries its own algorithm/digits/period;
+                    // this fallback is replaced by the parsed URI values.
+                    Some(TotpParams {
+                        algorithm: TotpAlgorithm::Sha1,
+                        digits: 6,
+                        period: 30,
+                    })
+                } else {
+                    match parse_totp_params(
+                        algorithm.as_str(),
+                        digits.as_str(),
+                        period.as_str(),
+                    ) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            win.set_status(format!("{e:#}").into());
+                            return;
+                        }
+                    }
+                };
+                let mut app = app.borrow_mut();
+                edit_totp(
+                    &mut app,
+                    &win,
+                    old_name.as_str(),
+                    new_name.as_str(),
+                    secret.as_str(),
+                    params,
+                );
+                *all_entries.lock().unwrap() = app.entries.clone();
+            },
+        );
     }
 
     {
@@ -1284,28 +1374,28 @@ fn run_gui() -> anyhow::Result<()> {
     {
         let app = app.clone();
         let win_weak = win.as_weak();
-        let all_names = all_names.clone();
+        let all_entries = all_entries.clone();
         win.on_remove_password(move |name| {
             let Some(win) = win_weak.upgrade() else {
                 return;
             };
             let mut app = app.borrow_mut();
             remove_password(&mut app, &win, name.as_str());
-            *all_names.lock().unwrap() = app.names.clone();
+            *all_entries.lock().unwrap() = app.entries.clone();
         });
     }
 
     {
         let app = app.clone();
         let win_weak = win.as_weak();
-        let all_names = all_names.clone();
+        let all_entries = all_entries.clone();
         win.on_refresh(move || {
             let Some(win) = win_weak.upgrade() else {
                 return;
             };
             let mut app = app.borrow_mut();
             refresh(&mut app, &win);
-            *all_names.lock().unwrap() = app.names.clone();
+            *all_entries.lock().unwrap() = app.entries.clone();
         });
     }
 
@@ -1426,6 +1516,30 @@ fn copy_password(app: &mut App, win: &ui::MainWindow, name: &str) -> bool {
         win.set_status(clipboard::CLIPBOARD_MANAGER_ERROR.into());
         return false;
     }
+
+    if app.keystore.has_totp(name) {
+        let ciphertext = match app.keystore.read_totp_ciphertext(name) {
+            Ok(c) => c,
+            Err(e) => {
+                win.set_status(format!("Read error: {e:#}").into());
+                return false;
+            }
+        };
+        let otp_ciphertext = match generate_totp_ciphertext(app, &ciphertext) {
+            Ok(c) => c,
+            Err(e) => {
+                win.set_status(format!("TOTP error: {e:#}").into());
+                return false;
+            }
+        };
+        if let Some(ref clip) = *app.clipboard.lock().unwrap() {
+            clip.hold(otp_ciphertext);
+            win.set_status(format!("Copied {name} TOTP to clipboard.").into());
+            return true;
+        }
+        return false;
+    }
+
     let ciphertext = match app.keystore.read_password_ciphertext(name) {
         Ok(c) => c,
         Err(e) => {
@@ -1442,6 +1556,32 @@ fn copy_password(app: &mut App, win: &ui::MainWindow, name: &str) -> bool {
     false
 }
 
+fn generate_totp_ciphertext(
+    app: &App,
+    ciphertext: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let aes_key = {
+        let c = app.cached.lock().unwrap();
+        c.as_slice()
+            .map(keystore::password_aes_key_from_main_key)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Key expired — please unlock again")
+            })?
+    };
+    let plain = {
+        let c = app.cached.lock().unwrap();
+        let mk = c.as_slice().ok_or_else(|| {
+            anyhow::anyhow!("Key expired — please unlock again")
+        })?;
+        keystore::decrypt_with_main_key(mk, ciphertext)?
+    };
+    let (params, secret) = totp::decode_entry(plain.as_slice())?;
+    let mut code = totp::generate_totp(secret, &params, unix_time()?)?;
+    let result = keystore::encrypt_with_aes_key(&aes_key, code.as_bytes());
+    zero_string(&mut code);
+    result
+}
+
 fn store_password(
     app: &mut App,
     win: &ui::MainWindow,
@@ -1453,7 +1593,7 @@ fn store_password(
         return false;
     }
 
-    if app.keystore.has_password(name) {
+    if app.keystore.has_password(name) || app.keystore.has_totp(name) {
         win.set_status(
             format!("{name} already exists. Use Edit to change it.").into(),
         );
@@ -1478,6 +1618,144 @@ fn store_password(
     refresh(app, win);
     win.set_status(format!("Stored {name}.").into());
     true
+}
+
+fn store_totp(
+    app: &mut App,
+    win: &ui::MainWindow,
+    name: &str,
+    secret: &str,
+    algorithm: &str,
+    digits: &str,
+    period: &str,
+) -> bool {
+    if name.is_empty() {
+        win.set_status("Name cannot be empty.".into());
+        return false;
+    }
+
+    if app.keystore.has_totp(name) || app.keystore.has_password(name) {
+        win.set_status(
+            format!("{name} already exists. Use Edit to change it.").into(),
+        );
+        return false;
+    }
+
+    let params = match parse_totp_params(algorithm, digits, period) {
+        Ok(p) => p,
+        Err(e) => {
+            win.set_status(format!("{e:#}").into());
+            return false;
+        }
+    };
+    let (mut secret, params) = match totp::resolve_secret(secret, params, false)
+    {
+        Ok(x) => x,
+        Err(e) => {
+            win.set_status(format!("Invalid secret: {e:#}").into());
+            return false;
+        }
+    };
+
+    let result = {
+        let c = app.cached.lock().unwrap();
+        match c.as_slice() {
+            Some(mk) => app.keystore.store_totp(name, &secret, &params, mk),
+            None => {
+                unsafe { clear_memory(&mut secret) };
+                return false;
+            }
+        }
+    };
+    unsafe { clear_memory(&mut secret) };
+
+    if let Err(e) = result {
+        win.set_status(format!("Store error: {e:#}").into());
+        return false;
+    }
+
+    refresh(app, win);
+    win.set_status(format!("Stored TOTP {name}.").into());
+    true
+}
+
+fn edit_totp(
+    app: &mut App,
+    win: &ui::MainWindow,
+    old_name: &str,
+    new_name: &str,
+    secret: &str,
+    params: Option<TotpParams>,
+) {
+    if new_name.is_empty() {
+        win.set_status("Name cannot be empty.".into());
+        return;
+    }
+
+    if secret.is_empty() {
+        if old_name != new_name
+            && let Err(e) = app.keystore.rename_totp(old_name, new_name)
+        {
+            win.set_status(format!("Rename error: {e:#}").into());
+            return;
+        }
+    } else {
+        let Some(params) = params else {
+            return;
+        };
+        let (mut secret, params) =
+            match totp::resolve_secret(secret, params, false) {
+                Ok(x) => x,
+                Err(e) => {
+                    win.set_status(format!("Invalid secret: {e:#}").into());
+                    return;
+                }
+            };
+
+        let result = {
+            let c = app.cached.lock().unwrap();
+            match c.as_slice() {
+                Some(mk) => {
+                    app.keystore.store_totp(new_name, &secret, &params, mk)
+                }
+                None => {
+                    unsafe { clear_memory(&mut secret) };
+                    return;
+                }
+            }
+        };
+        unsafe { clear_memory(&mut secret) };
+        if let Err(e) = result {
+            win.set_status(format!("Store error: {e:#}").into());
+            return;
+        }
+        if old_name != new_name
+            && let Err(e) = app.keystore.remove_totp(old_name)
+        {
+            win.set_status(format!("Remove error: {e:#}").into());
+            return;
+        }
+    }
+
+    refresh(app, win);
+    win.set_status(format!("Updated {new_name}.").into());
+}
+
+fn parse_totp_params(
+    algorithm: &str,
+    digits: &str,
+    period: &str,
+) -> anyhow::Result<TotpParams> {
+    let algorithm = algorithm.parse::<TotpAlgorithm>()?;
+    let digits: u8 = digits.trim().parse().context("invalid digits")?;
+    let period: u32 = period.trim().parse().context("invalid period")?;
+    let params = TotpParams {
+        algorithm,
+        digits,
+        period,
+    };
+    params.validate()?;
+    Ok(params)
 }
 
 fn edit_password(
@@ -1528,7 +1806,12 @@ fn edit_password(
 }
 
 fn remove_password(app: &mut App, win: &ui::MainWindow, name: &str) {
-    match app.keystore.remove_password(name) {
+    let result = if app.keystore.has_totp(name) {
+        app.keystore.remove_totp(name)
+    } else {
+        app.keystore.remove_password(name)
+    };
+    match result {
         Ok(()) => {
             refresh(app, win);
             win.set_status(format!("Removed {name}.").into());
@@ -1540,16 +1823,11 @@ fn remove_password(app: &mut App, win: &ui::MainWindow, name: &str) {
 }
 
 fn refresh(app: &mut App, win: &ui::MainWindow) {
-    match app.keystore.list_passwords() {
-        Ok(names) => {
-            app.names = names;
-            let shared: Vec<slint::SharedString> = app
-                .names
-                .iter()
-                .map(|n| slint::SharedString::from(n.as_str()))
-                .collect();
-            let model = slint::VecModel::from(shared);
-            win.set_password_names(slint::ModelRc::new(model));
+    match list_entries(&app.keystore) {
+        Ok(entries) => {
+            app.entries = entries.clone();
+            let model = slint::VecModel::from(entries);
+            win.set_entries(slint::ModelRc::new(model));
         }
         Err(e) => {
             win.set_status(format!("List error: {e:#}").into());
@@ -1557,11 +1835,29 @@ fn refresh(app: &mut App, win: &ui::MainWindow) {
     }
 }
 
+fn list_entries(keystore: &Keystore) -> anyhow::Result<Vec<ui::EntryInfo>> {
+    let mut entries = Vec::new();
+    for name in keystore.list_passwords()? {
+        entries.push(ui::EntryInfo {
+            name: name.into(),
+            is_totp: false,
+        });
+    }
+    for name in keystore.list_totps()? {
+        entries.push(ui::EntryInfo {
+            name: name.into(),
+            is_totp: true,
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
 struct App {
     keystore: Arc<Keystore>,
     clipboard: Arc<Mutex<Option<clipboard::ClipboardHandle>>>,
     cached: Arc<Mutex<CachedKey>>,
-    names: Vec<String>,
+    entries: Vec<ui::EntryInfo>,
     clipboard_blocked: bool,
 }
 

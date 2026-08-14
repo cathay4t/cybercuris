@@ -1,17 +1,30 @@
-import { Button, LineEdit, ListView, VerticalBox, HorizontalBox, StandardButton } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ListView, VerticalBox, HorizontalBox, StandardButton } from "std-widgets.slint";
+
+export struct EntryInfo {
+    name: string,
+    is-totp: bool,
+}
 
 export component MainWindow inherits Window {
     title: "cybercuris";
     min-width: 420px;
     min-height: 480px;
 
-    in property <[string]> password-names;
+    in property <[EntryInfo]> entries;
     in property <string> status;
     in-out property <bool> locked: true;
     in property <bool> needs-init: false;
     in-out property <bool> show-add-password: false;
     in-out property <bool> show-edit-password: false;
     in-out property <bool> show-settings: false;
+    in-out property <bool> add-is-totp: false;
+    in-out property <bool> edit-is-totp: false;
+    in-out property <bool> add-show-more: false;
+    in-out property <bool> edit-show-more: false;
+    in-out property <int> add-algorithm-index: 0;
+    in-out property <string> add-digits: "6";
+    in-out property <string> add-period: "30";
+    in-out property <bool> add-uri-detected: false;
     in-out property <string> edit-original-name;
     in-out property <string> filter-text;
     in property <string> quit-shortcut-key: "x";
@@ -19,7 +32,10 @@ export component MainWindow inherits Window {
     in property <string> settings-timeout-minutes;
 
     callback store-password(name: string, password: string) -> bool;
+    callback store-totp(name: string, secret: string, algorithm: string, digits: string, period: string) -> bool;
+    callback totp-secret-changed(secret: string);
     callback edit-password(old-name: string, new-name: string, new-password: string);
+    callback edit-totp(old-name: string, new-name: string, secret: string, algorithm: string, digits: string, period: string);
     callback copy-password(name: string);
     callback remove-password(name: string);
     callback refresh();
@@ -127,7 +143,7 @@ export component MainWindow inherits Window {
             spacing: 4px;
 
             Text {
-                text: "Stored Passwords";
+                text: "Stored Passwords & TOTPs";
                 font-size: 16px;
                 font-weight: 700;
             }
@@ -138,25 +154,25 @@ export component MainWindow inherits Window {
                 init => { search.focus(); }
                 edited => { root.filter-changed(root.filter-text); }
                 accepted => {
-                    if root.password-names.length > 0 {
-                        root.copy-password(root.password-names[0]);
+                    if root.entries.length > 0 {
+                        root.copy-password(root.entries[0].name);
                     }
                 }
             }
 
             ListView {
                 vertical-stretch: 1;
-                for name[idx] in root.password-names: HorizontalBox {
+                for entry[idx] in root.entries: HorizontalBox {
                     padding: 2px;
                     if idx == 0 : Text {
-                        text: name;
+                        text: entry.is-totp ? entry.name + " (TOTP)" : entry.name;
                         horizontal-stretch: 1;
                         overflow: elide;
                         color: #1564c0;
                         font-size: 1.5rem;
                     }
                     if idx != 0 : Text {
-                        text: name;
+                        text: entry.is-totp ? entry.name + " (TOTP)" : entry.name;
                         horizontal-stretch: 1;
                         overflow: elide;
                         font-size: 1.5rem;
@@ -164,13 +180,15 @@ export component MainWindow inherits Window {
                     Button {
                         text: "Copy";
                         clicked => {
-                            root.copy-password(name);
+                            root.copy-password(entry.name);
                         }
                     }
                     Button {
                         text: "Edit";
                         clicked => {
-                            root.edit-original-name = name;
+                            root.edit-original-name = entry.name;
+                            root.edit-is-totp = entry.is-totp;
+                            root.edit-show-more = false;
                             root.show-add-password = false;
                             root.show-settings = false;
                             root.show-edit-password = true;
@@ -179,7 +197,7 @@ export component MainWindow inherits Window {
                     Button {
                         text: "Remove";
                         clicked => {
-                            root.remove-password(name);
+                            root.remove-password(entry.name);
                         }
                     }
                 }
@@ -193,15 +211,69 @@ export component MainWindow inherits Window {
                     init => { name-edit.focus(); }
                 }
 
+                totp-check := CheckBox {
+                    text: "TOTP";
+                    checked <=> root.add-is-totp;
+                }
+
                 password-edit := LineEdit {
                     placeholder-text: "Password";
                     input-type: password;
+                    visible: !root.add-is-totp;
                     accepted => {
-                        if root.store-password(name-edit.text, password-edit.text) {
+                        if !root.add-is-totp && root.store-password(name-edit.text, password-edit.text) {
                             password-edit.text = "";
                             root.show-add-password = false;
                             root.filter-text = "";
                             search.focus();
+                        }
+                    }
+                }
+
+                secret-edit := LineEdit {
+                    placeholder-text: "Secret (base32 or otpauth:// URI)";
+                    input-type: password;
+                    visible: root.add-is-totp;
+                    edited => { root.totp-secret-changed(secret-edit.text); }
+                }
+
+                Button {
+                    text: root.add-show-more ? "Less" : "More";
+                    visible: root.add-is-totp && !root.add-uri-detected;
+                    clicked => { root.add-show-more = !root.add-show-more; }
+                }
+
+                algo-combo := ComboBox {
+                    visible: root.add-is-totp && !root.add-uri-detected && root.add-show-more;
+                    model: ["sha1", "sha256", "sha512"];
+                    current-index <=> root.add-algorithm-index;
+                }
+
+                HorizontalBox {
+                    spacing: 4px;
+                    visible: root.add-is-totp && !root.add-uri-detected && root.add-show-more;
+
+                    VerticalBox {
+                        spacing: 2px;
+                        Text {
+                            text: "Digits";
+                            font-size: 12px;
+                        }
+                        digits-edit := LineEdit {
+                            placeholder-text: "6-8";
+                            text <=> root.add-digits;
+                        }
+                    }
+
+                    VerticalBox {
+                        spacing: 2px;
+                        Text {
+                            text: "Interval(seconds)";
+                            font-size: 12px;
+                        }
+                        period-edit := LineEdit {
+                            placeholder-text: "Seconds";
+                            text <=> root.add-period;
                         }
                     }
                 }
@@ -213,6 +285,12 @@ export component MainWindow inherits Window {
                     Button {
                         text: "Cancel";
                         clicked => {
+                            root.add-is-totp = false;
+                            root.add-uri-detected = false;
+                            root.add-show-more = false;
+                            root.add-algorithm-index = 0;
+                            root.add-digits = "6";
+                            root.add-period = "30";
                             root.show-add-password = false;
                             root.filter-text = "";
                             search.focus();
@@ -222,11 +300,26 @@ export component MainWindow inherits Window {
                         text: "Store";
                         primary: true;
                         clicked => {
-                            if root.store-password(name-edit.text, password-edit.text) {
-                                password-edit.text = "";
-                                root.show-add-password = false;
-                                root.filter-text = "";
-                                search.focus();
+                            if root.add-is-totp {
+                                if root.store-totp(name-edit.text, secret-edit.text, algo-combo.current-value, digits-edit.text, period-edit.text) {
+                                    secret-edit.text = "";
+                                    root.add-is-totp = false;
+                                    root.add-uri-detected = false;
+                                    root.add-show-more = false;
+                                    root.add-algorithm-index = 0;
+                                    root.add-digits = "6";
+                                    root.add-period = "30";
+                                    root.show-add-password = false;
+                                    root.filter-text = "";
+                                    search.focus();
+                                }
+                            } else {
+                                if root.store-password(name-edit.text, password-edit.text) {
+                                    password-edit.text = "";
+                                    root.show-add-password = false;
+                                    root.filter-text = "";
+                                    search.focus();
+                                }
                             }
                         }
                     }
@@ -247,12 +340,62 @@ export component MainWindow inherits Window {
                 edit-password-edit := LineEdit {
                     placeholder-text: "Password (leave empty to keep current)";
                     input-type: password;
+                    visible: !root.edit-is-totp;
                     accepted => {
-                        root.edit-password(root.edit-original-name, edit-name-edit.text, edit-password-edit.text);
-                        edit-password-edit.text = "";
-                        root.show-edit-password = false;
-                        root.filter-text = "";
-                        search.focus();
+                        if !root.edit-is-totp {
+                            root.edit-password(root.edit-original-name, edit-name-edit.text, edit-password-edit.text);
+                            edit-password-edit.text = "";
+                            root.show-edit-password = false;
+                            root.filter-text = "";
+                            search.focus();
+                        }
+                    }
+                }
+
+                edit-secret-edit := LineEdit {
+                    placeholder-text: "Secret (leave empty to keep current)";
+                    input-type: password;
+                    visible: root.edit-is-totp;
+                }
+
+                Button {
+                    text: root.edit-show-more ? "Less" : "More";
+                    visible: root.edit-is-totp;
+                    clicked => { root.edit-show-more = !root.edit-show-more; }
+                }
+
+                edit-algo-combo := ComboBox {
+                    visible: root.edit-is-totp && root.edit-show-more;
+                    model: ["sha1", "sha256", "sha512"];
+                    current-index: 0;
+                }
+
+                HorizontalBox {
+                    spacing: 4px;
+                    visible: root.edit-is-totp && root.edit-show-more;
+
+                    VerticalBox {
+                        spacing: 2px;
+                        Text {
+                            text: "Digits";
+                            font-size: 12px;
+                        }
+                        edit-digits-edit := LineEdit {
+                            placeholder-text: "6-8";
+                            text: "6";
+                        }
+                    }
+
+                    VerticalBox {
+                        spacing: 2px;
+                        Text {
+                            text: "Interval(seconds)";
+                            font-size: 12px;
+                        }
+                        edit-period-edit := LineEdit {
+                            placeholder-text: "Seconds";
+                            text: "30";
+                        }
                     }
                 }
 
@@ -263,6 +406,7 @@ export component MainWindow inherits Window {
                     Button {
                         text: "Cancel";
                         clicked => {
+                            root.edit-show-more = false;
                             root.show-edit-password = false;
                             root.filter-text = "";
                             search.focus();
@@ -272,8 +416,13 @@ export component MainWindow inherits Window {
                         text: "Save";
                         primary: true;
                         clicked => {
-                            root.edit-password(root.edit-original-name, edit-name-edit.text, edit-password-edit.text);
-                            edit-password-edit.text = "";
+                            if root.edit-is-totp {
+                                root.edit-totp(root.edit-original-name, edit-name-edit.text, edit-secret-edit.text, edit-algo-combo.current-value, edit-digits-edit.text, edit-period-edit.text);
+                            } else {
+                                root.edit-password(root.edit-original-name, edit-name-edit.text, edit-password-edit.text);
+                                edit-password-edit.text = "";
+                            }
+                            root.edit-show-more = false;
                             root.show-edit-password = false;
                             root.filter-text = "";
                             search.focus();
@@ -379,6 +528,12 @@ export component MainWindow inherits Window {
                 Button {
                     text: "Add";
                     clicked => {
+                        root.add-is-totp = false;
+                        root.add-uri-detected = false;
+                        root.add-show-more = false;
+                        root.add-algorithm-index = 0;
+                        root.add-digits = "6";
+                        root.add-period = "30";
                         root.show-edit-password = false;
                         root.show-settings = false;
                         root.show-add-password = true;

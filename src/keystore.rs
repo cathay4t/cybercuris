@@ -236,6 +236,15 @@ impl Keystore {
         Ok(())
     }
 
+    pub(crate) fn remove_totp(&self, name: &str) -> anyhow::Result<()> {
+        let path = self
+            .resolve_totp_path(name)
+            .ok_or_else(|| anyhow::anyhow!("TOTP not found: {name}"))?;
+        fs::remove_file(&path)
+            .with_context(|| format!("removing TOTP for {name}"))?;
+        Ok(())
+    }
+
     pub(crate) fn rename_password(
         &self,
         old_name: &str,
@@ -261,6 +270,19 @@ impl Keystore {
             let _ = fs::remove_file(&legacy);
         }
         Ok(())
+    }
+
+    pub(crate) fn rename_totp(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> anyhow::Result<()> {
+        let old_path = self
+            .resolve_totp_path(old_name)
+            .ok_or_else(|| anyhow::anyhow!("TOTP not found: {old_name}"))?;
+        let new_path = self.totp_path(new_name);
+        fs::rename(&old_path, &new_path)
+            .with_context(|| format!("renaming TOTP {old_name} to {new_name}"))
     }
 
     pub(crate) fn list_passwords(&self) -> anyhow::Result<Vec<String>> {

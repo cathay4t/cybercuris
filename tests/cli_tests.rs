@@ -192,10 +192,22 @@ fn test_cli_store_totp_list() {
     assert!(ok, "store-totp sha512 failed: {out}");
     assert!(out.contains("Stored TOTP for otp2"), "stdout={out}");
 
+    // otpauth:// URI: algorithm, digits, and period are auto-detected.
+    let input = format!(
+        "{}otpauth://totp/Example:alice@example.com?secret=JBSWY3DPEE&\
+         issuer=Example&algorithm=SHA256&digits=8&period=60\n",
+        MAIN_PASS
+    );
+    let (out, _, ok) =
+        run_stdin(home, &["-t", "store-totp", "otp3"], input.as_bytes());
+    assert!(ok, "store-totp otpauth URI failed: {out}");
+    assert!(out.contains("Stored TOTP for otp3"), "stdout={out}");
+
     let (out, _, ok) = run(home, &["-t", "list"]);
     assert!(ok, "list failed: {out}");
     assert!(out.contains("otp1 (TOTP)"), "list={out}");
     assert!(out.contains("otp2 (TOTP)"), "list={out}");
+    assert!(out.contains("otp3 (TOTP)"), "list={out}");
 
     let _ = fs::remove_dir_all(data_home(home));
 }
