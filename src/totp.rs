@@ -2,15 +2,13 @@
 use std::{fmt, str::FromStr};
 
 use anyhow::{Context as _, anyhow, bail};
-use hmac::{Hmac, KeyInit as KeyInit013, Mac as Mac013};
-use hmac012::Mac as Mac012;
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
 
-/// HMAC instances per RFC 6238: SHA-1 uses the sha1 0.10 / hmac 0.12
-/// (digest 0.10) stack; SHA-256 and SHA-512 use sha2 0.11 / hmac 0.13
-/// (digest 0.11).
-type HmacSha1 = hmac012::Hmac<Sha1>;
+/// HMAC instances per RFC 6238, all on the sha2/sha1 0.11 / hmac 0.13
+/// (digest 0.11) stack.
+type HmacSha1 = Hmac<Sha1>;
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
 
@@ -178,21 +176,21 @@ pub fn generate_totp(
 }
 
 fn hmac_sha1(key: &[u8], msg: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut mac = <HmacSha1 as Mac012>::new_from_slice(key)
+    let mut mac = <HmacSha1 as KeyInit>::new_from_slice(key)
         .context("invalid TOTP key")?;
     mac.update(msg);
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut mac = <HmacSha256 as KeyInit013>::new_from_slice(key)
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key)
         .context("invalid TOTP key")?;
     mac.update(msg);
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
 fn hmac_sha512(key: &[u8], msg: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut mac = <HmacSha512 as KeyInit013>::new_from_slice(key)
+    let mut mac = <HmacSha512 as KeyInit>::new_from_slice(key)
         .context("invalid TOTP key")?;
     mac.update(msg);
     Ok(mac.finalize().into_bytes().to_vec())
