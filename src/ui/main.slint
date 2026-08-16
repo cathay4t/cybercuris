@@ -38,6 +38,7 @@ export component MainWindow inherits Window {
     callback edit-password(old-name: string, new-name: string, new-password: string);
     callback edit-totp(old-name: string, new-name: string, secret: string, algorithm: string, digits: string, period: string);
     callback copy-password(name: string);
+    callback show-totp(name: string);
     callback remove-password(name: string);
     callback refresh();
     callback hide-window();
@@ -205,14 +206,20 @@ export component MainWindow inherits Window {
                             color: idx == root.selected-index ? #1564c0 : Palette.foreground;
                             font-size: 1.5rem;
                         }
+                        if entry.is-totp : Button {
+                            text: "\u{1fae3}";
+                            clicked => {
+                                root.show-totp(entry.name);
+                            }
+                        }
                         Button {
-                            text: "Copy";
+                            text: "\u{1f4cb}";
                             clicked => {
                                 root.copy-password(entry.name);
                             }
                         }
                         Button {
-                            text: "Edit";
+                            text: "\u{270f}\u{fe0f}";
                             clicked => {
                                 root.edit-original-name = entry.name;
                                 root.edit-is-totp = entry.is-totp;
@@ -223,7 +230,7 @@ export component MainWindow inherits Window {
                             }
                         }
                         Button {
-                            text: "Remove";
+                            text: "\u{26d4}";
                             clicked => {
                                 root.remove-password(entry.name);
                             }

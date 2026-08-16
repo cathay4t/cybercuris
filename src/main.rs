@@ -1376,6 +1376,18 @@ fn run_gui() -> anyhow::Result<()> {
     {
         let app = app.clone();
         let win_weak = win.as_weak();
+        win.on_show_totp(move |name| {
+            let Some(win) = win_weak.upgrade() else {
+                return;
+            };
+            let mut app = app.borrow_mut();
+            show_totp(&mut app, &win, name.as_str());
+        });
+    }
+
+    {
+        let app = app.clone();
+        let win_weak = win.as_weak();
         let all_entries = all_entries.clone();
         win.on_remove_password(move |name| {
             let Some(win) = win_weak.upgrade() else {
@@ -1558,6 +1570,16 @@ fn copy_password(app: &mut App, win: &ui::MainWindow, name: &str) -> bool {
     false
 }
 
+fn generate_totp_plain(app: &App, ciphertext: &[u8]) -> anyhow::Result<String> {
+    let c = app.cached.lock().unwrap();
+    let mk = c
+        .as_slice()
+        .ok_or_else(|| anyhow::anyhow!("Key expired — please unlock again"))?;
+    let plain = keystore::decrypt_with_main_key(mk, ciphertext)?;
+    let (params, secret) = totp::decode_entry(plain.as_slice())?;
+    totp::generate_totp(secret, &params, unix_time()?)
+}
+
 fn generate_totp_ciphertext(
     app: &App,
     ciphertext: &[u8],
@@ -1570,18 +1592,31 @@ fn generate_totp_ciphertext(
                 anyhow::anyhow!("Key expired — please unlock again")
             })?
     };
-    let plain = {
-        let c = app.cached.lock().unwrap();
-        let mk = c.as_slice().ok_or_else(|| {
-            anyhow::anyhow!("Key expired — please unlock again")
-        })?;
-        keystore::decrypt_with_main_key(mk, ciphertext)?
-    };
-    let (params, secret) = totp::decode_entry(plain.as_slice())?;
-    let mut code = totp::generate_totp(secret, &params, unix_time()?)?;
+    let mut code = generate_totp_plain(app, ciphertext)?;
     let result = keystore::encrypt_with_aes_key(&aes_key, code.as_bytes());
     zero_string(&mut code);
     result
+}
+
+fn show_totp(app: &mut App, win: &ui::MainWindow, name: &str) {
+    let ciphertext = match app.keystore.read_totp_ciphertext(name) {
+        Ok(c) => c,
+        Err(e) => {
+            win.set_status(format!("Read error: {e:#}").into());
+            return;
+        }
+    };
+    let mut code = match generate_totp_plain(app, &ciphertext) {
+        Ok(c) => c,
+        Err(e) => {
+            win.set_status(format!("TOTP error: {e:#}").into());
+            return;
+        }
+    };
+    let mut msg = format!("{name} TOTP: {code}");
+    win.set_status(msg.clone().into());
+    zero_string(&mut code);
+    zero_string(&mut msg);
 }
 
 fn store_password(
