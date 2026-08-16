@@ -1,4 +1,4 @@
-import { Button, CheckBox, ComboBox, LineEdit, ListView, VerticalBox, HorizontalBox, StandardButton } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ListView, VerticalBox, HorizontalBox, StandardButton, Palette } from "std-widgets.slint";
 
 export struct EntryInfo {
     name: string,
@@ -27,6 +27,7 @@ export component MainWindow inherits Window {
     in-out property <bool> add-uri-detected: false;
     in-out property <string> edit-original-name;
     in-out property <string> filter-text;
+    in-out property <int> selected-index: 0;
     in property <string> quit-shortcut-key: "x";
     in property <string> hide-shortcut-key: "h";
     in property <string> settings-timeout-minutes;
@@ -153,51 +154,79 @@ export component MainWindow inherits Window {
                 text <=> root.filter-text;
                 init => { search.focus(); }
                 edited => { root.filter-changed(root.filter-text); }
+                key-pressed(event) => {
+                    if event.text == "\u{0009}" && !event.modifiers.shift {
+                        if root.selected-index + 1 < root.entries.length {
+                            root.selected-index += 1;
+                        }
+                        return accept;
+                    }
+                    if event.text == "\u{0019}" || (event.text == "\u{0009}" && event.modifiers.shift) {
+                        if root.selected-index > 0 {
+                            root.selected-index -= 1;
+                        }
+                        return accept;
+                    }
+                    if event.text == "\u{f701}" {
+                        if root.selected-index + 1 < root.entries.length {
+                            root.selected-index += 1;
+                        }
+                        return accept;
+                    }
+                    if event.text == "\u{f700}" {
+                        if root.selected-index > 0 {
+                            root.selected-index -= 1;
+                        }
+                        return accept;
+                    }
+                    reject
+                }
                 accepted => {
                     if root.entries.length > 0 {
-                        root.copy-password(root.entries[0].name);
+                        root.copy-password(root.entries[root.selected-index].name);
                     }
                 }
             }
 
             ListView {
                 vertical-stretch: 1;
-                for entry[idx] in root.entries: HorizontalBox {
-                    padding: 2px;
-                    if idx == 0 : Text {
-                        text: entry.is-totp ? entry.name + " (TOTP)" : entry.name;
-                        horizontal-stretch: 1;
-                        overflow: elide;
-                        color: #1564c0;
-                        font-size: 1.5rem;
+                for entry[idx] in root.entries: Rectangle {
+                    height: row.preferred-height;
+                    background: idx == root.selected-index ? #1564c020 : transparent;
+                    TouchArea {
+                        clicked => { root.selected-index = idx; }
                     }
-                    if idx != 0 : Text {
-                        text: entry.is-totp ? entry.name + " (TOTP)" : entry.name;
-                        horizontal-stretch: 1;
-                        overflow: elide;
-                        font-size: 1.5rem;
-                    }
-                    Button {
-                        text: "Copy";
-                        clicked => {
-                            root.copy-password(entry.name);
+                    row := HorizontalBox {
+                        padding: 2px;
+                        Text {
+                            text: entry.is-totp ? entry.name + " (TOTP)" : entry.name;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                            color: idx == root.selected-index ? #1564c0 : Palette.foreground;
+                            font-size: 1.5rem;
                         }
-                    }
-                    Button {
-                        text: "Edit";
-                        clicked => {
-                            root.edit-original-name = entry.name;
-                            root.edit-is-totp = entry.is-totp;
-                            root.edit-show-more = false;
-                            root.show-add-password = false;
-                            root.show-settings = false;
-                            root.show-edit-password = true;
+                        Button {
+                            text: "Copy";
+                            clicked => {
+                                root.copy-password(entry.name);
+                            }
                         }
-                    }
-                    Button {
-                        text: "Remove";
-                        clicked => {
-                            root.remove-password(entry.name);
+                        Button {
+                            text: "Edit";
+                            clicked => {
+                                root.edit-original-name = entry.name;
+                                root.edit-is-totp = entry.is-totp;
+                                root.edit-show-more = false;
+                                root.show-add-password = false;
+                                root.show-settings = false;
+                                root.show-edit-password = true;
+                            }
+                        }
+                        Button {
+                            text: "Remove";
+                            clicked => {
+                                root.remove-password(entry.name);
+                            }
                         }
                     }
                 }

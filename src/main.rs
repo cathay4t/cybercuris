@@ -1081,6 +1081,7 @@ fn run_gui() -> anyhow::Result<()> {
                             win.set_entries(slint::ModelRc::new(
                                 slint::VecModel::from(entries),
                             ));
+                            win.set_selected_index(0);
                         });
                         Ok(())
                     }),
@@ -1218,6 +1219,7 @@ fn run_gui() -> anyhow::Result<()> {
             win.set_entries(slint::ModelRc::new(slint::VecModel::from(
                 filtered,
             )));
+            win.set_selected_index(0);
         });
     }
 
@@ -1828,6 +1830,7 @@ fn refresh(app: &mut App, win: &ui::MainWindow) {
             app.entries = entries.clone();
             let model = slint::VecModel::from(entries);
             win.set_entries(slint::ModelRc::new(model));
+            win.set_selected_index(0);
         }
         Err(e) => {
             win.set_status(format!("List error: {e:#}").into());
